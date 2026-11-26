@@ -25,6 +25,7 @@ import {
   exp,
   float,
   int,
+  ivec2,
   length,
   max,
   mix,
@@ -36,6 +37,7 @@ import {
   smoothstep,
   storage,
   texture,
+  textureLoad,
   uniform,
   uv,
   vec3,
@@ -69,11 +71,16 @@ export function buildRadiantGINode(
   roughnessVal = 0.8,
   metalnessVal = 0.0,
 ) {
-  const patchBuf = storage(
-    engine.worldPatchStorage,
-    'vec4',
-    MAX_RENDER_PATCHES * WORLD_PATCH_VEC4S,
-  ).toReadOnly();
+  const useTextureFallback = engine.isCPUFallback;
+  const patchBuf = useTextureFallback
+    ? null
+    : storage(
+        engine.worldPatchStorage,
+        'vec4',
+        MAX_RENDER_PATCHES * WORLD_PATCH_VEC4S,
+      ).toReadOnly();
+  const patchTex = engine.worldPatchTexture;
+  const objRow = int(objectId);
 
   const patchStart = int(objectId * PATCHES_PER_OBJECT);
   const roughF = float(Math.min(1.0, Math.max(0.08, roughnessVal)));
@@ -96,15 +103,25 @@ export function buildRadiantGINode(
     const specNorm = specExp.add(2.0).div(6.2831853);
 
     Loop(PATCHES_PER_OBJECT, ({ i }) => {
-      const pIdx = patchStart.add(i);
-      const base = pIdx.mul(WORLD_PATCH_VEC4S);
-
-      const p0 = patchBuf.element(base.add(0)); // pos.xyz, radius
-      const p1 = patchBuf.element(base.add(1)); // N.xyz, area
-      const p2 = patchBuf.element(base.add(2)); // I0.rgb, IN.r
-      const p3 = patchBuf.element(base.add(3)); // I1_world_R.xyz, IN.g
-      const p4 = patchBuf.element(base.add(4)); // I1_world_G.xyz, IN.b
-      const p5 = patchBuf.element(base.add(5)); // I1_world_B.xyz, errVal
+      let p0: any, p1: any, p2: any, p3: any, p4: any, p5: any;
+      if (useTextureFallback) {
+        const colBase = i.mul(WORLD_PATCH_VEC4S);
+        p0 = textureLoad(patchTex, ivec2(colBase.add(0), objRow));
+        p1 = textureLoad(patchTex, ivec2(colBase.add(1), objRow));
+        p2 = textureLoad(patchTex, ivec2(colBase.add(2), objRow));
+        p3 = textureLoad(patchTex, ivec2(colBase.add(3), objRow));
+        p4 = textureLoad(patchTex, ivec2(colBase.add(4), objRow));
+        p5 = textureLoad(patchTex, ivec2(colBase.add(5), objRow));
+      } else {
+        const pIdx = patchStart.add(i);
+        const base = pIdx.mul(WORLD_PATCH_VEC4S);
+        p0 = patchBuf!.element(base.add(0)); // pos.xyz, radius
+        p1 = patchBuf!.element(base.add(1)); // N.xyz, area
+        p2 = patchBuf!.element(base.add(2)); // I0.rgb, IN.r
+        p3 = patchBuf!.element(base.add(3)); // I1_world_R.xyz, IN.g
+        p4 = patchBuf!.element(base.add(4)); // I1_world_G.xyz, IN.b
+        p5 = patchBuf!.element(base.add(5)); // I1_world_B.xyz, errVal
+      }
 
       const pPos = p0.xyz;
       const pRad = max(p0.w, 0.16);

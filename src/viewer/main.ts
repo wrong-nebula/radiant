@@ -102,13 +102,6 @@ class RadiantShowcaseApp {
   }
 
   private async _init(): Promise<void> {
-    if (!('gpu' in navigator)) {
-      const badge = document.getElementById('gpu-badge');
-      if (badge) badge.textContent = 'WebGPU Unavailable';
-      this._showToast('WebGPU is required (try Chrome 113+, Edge, or Safari 18+ with WebGPU enabled).');
-      throw new Error('navigator.gpu is not available in this browser');
-    }
-
     this.renderer = new THREE.WebGPURenderer({
       canvas: this.canvas,
       antialias: true,
@@ -179,12 +172,18 @@ class RadiantShowcaseApp {
 
     const badge = document.getElementById('gpu-badge');
     if (badge) {
-      badge.textContent = `WebGPU · ${this.engine.header.nLayers}L FP16`;
+      badge.textContent = this.engine.isCPUFallback
+        ? `WebGL2 · ${this.engine.header.nLayers}L CPU GI`
+        : `WebGPU · ${this.engine.header.nLayers}L FP16`;
     }
 
     // Compute live 3-bounce indirect GI the instant weights finish downloading!
     await this.recomputeGI();
-    this._showToast('RADIANT-GI Ready — drag any wall, lamp, or sculpture live!');
+    this._showToast(
+      this.engine.isCPUFallback
+        ? 'WebGL2 + CPU GI Ready (open in Chrome/Safari for GPU WebGPU Compute)'
+        : 'RADIANT-GI Ready — drag any wall, lamp, or sculpture live!',
+    );
     this.resolveReady();
   }
 

@@ -15,6 +15,7 @@ import {
   SH_STRIDE,
   TOKEN_STRIDE,
 } from './shMath.ts';
+import { runRadiantCPU, unpackRDGIWeightsF32 } from './cpuFallback.ts';
 
 export interface RDGIHeader {
   version: number;
@@ -714,10 +715,12 @@ export const WORLD_PATCH_VEC4S = 6;
 export const MAX_RENDER_PATCHES = 1024;
 
 export class RadiantComputeEngine {
-  public readonly device: GPUDevice;
+  public readonly device: GPUDevice | null;
+  public readonly isCPUFallback: boolean;
   public header!: RDGIHeader;
   private layout!: WeightLayout;
-  private weightsBuf!: GPUBuffer;
+  private weightsBuf: GPUBuffer | null = null;
+  private cpuWeightsF32: Float32Array | null = null;
 
   // Compute pipelines
   private pipeCentroid!: GPUComputePipeline;
@@ -759,13 +762,14 @@ export class RadiantComputeEngine {
   private paramsCPU = new Uint32Array((256 * 256) / 4);
   private paramsCPUF32 = new Float32Array(this.paramsCPU.buffer);
 
-  // Shared Three.js TSL StorageBufferAttribute for world-space SH evaluation
+  // Shared Three.js TSL StorageBufferAttribute (WebGPU) + RGBA32F DataTexture (WebGL2 fallback)
   public readonly worldPatchArray = new Float32Array(MAX_RENDER_PATCHES * WORLD_PATCH_VEC4S * 4);
   public readonly worldPatchStorage: THREE.StorageBufferAttribute;
+  public readonly worldPatchTexture: THREE.DataTexture;
   public activeTokenCount = 0;
   public lastComputeMs = 0;
-  public lastLocalSH = new Float32Array(0);
-  public lastWorldTokens = new Float32Array(0);
+  public lastLocalSH: Float32Array = new Float32Array(0);
+  public lastWorldTokens: Float32Array = new Float32Array(0);
 
   // Cached GPUBindGroups (rebuilt only when capacity or weights change — zero per-frame allocation!)
   private cachedBGs: {
@@ -794,24 +798,40 @@ export class RadiantComputeEngine {
   private isBusy = false;
   private inferQueue: Promise<unknown> = Promise.resolve();
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice | null) {
     this.device = device;
+    this.isCPUFallback = device === null;
     this.worldPatchStorage = new THREE.StorageBufferAttribute(this.worldPatchArray, 4);
-    this._createPipelines();
+    this.worldPatchTexture = new THREE.DataTexture(
+      this.worldPatchArray,
+      PATCHES_PER_OBJECT * WORLD_PATCH_VEC4S, // 192 vec4s per object row
+      MAX_RENDER_PATCHES / PATCHES_PER_OBJECT, // 32 objects max
+      THREE.RGBAFormat,
+      THREE.FloatType,
+    );
+    this.worldPatchTexture.minFilter = THREE.NearestFilter;
+    this.worldPatchTexture.magFilter = THREE.NearestFilter;
+    this.worldPatchTexture.generateMipmaps = false;
+    this.worldPatchTexture.needsUpdate = true;
+    if (this.device) {
+      this._createPipelines();
+    }
   }
 
   public static async createUnloadedFromRenderer(
     renderer: THREE.WebGPURenderer,
   ): Promise<RadiantComputeEngine> {
     const backend = (renderer as any).backend;
-    let device: GPUDevice | undefined = backend?.device;
-    if (!device) {
-      if (!navigator.gpu) {
-        throw new Error('WebGPU is not available in this browser');
+    let device: GPUDevice | null = backend?.device ?? null;
+    if (!device && typeof navigator !== 'undefined' && navigator.gpu) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (adapter) {
+          device = await adapter.requestDevice();
+        }
+      } catch {
+        device = null;
       }
-      const adapter = await navigator.gpu.requestAdapter();
-      if (!adapter) throw new Error('Failed to acquire WebGPU adapter');
-      device = await adapter.requestDevice();
     }
     return new RadiantComputeEngine(device);
   }
@@ -827,7 +847,7 @@ export class RadiantComputeEngine {
   }
 
   public get isWeightsLoaded(): boolean {
-    return this.weightsBuf !== null;
+    return this.isCPUFallback ? this.cpuWeightsF32 !== null : this.weightsBuf !== null;
   }
 
   public static async createStandalone(weightsUrlOrBuffer: string | ArrayBuffer): Promise<RadiantComputeEngine> {
@@ -845,10 +865,11 @@ export class RadiantComputeEngine {
   }
 
   private _createPipelines(): void {
+    const device = this.device!;
     const mk = (code: string, dynamicUniform: boolean) => {
-      const module = this.device.createShaderModule({ code });
+      const module = device.createShaderModule({ code });
       if (!dynamicUniform) {
-        return this.device.createComputePipeline({
+        return device.createComputePipeline({
           layout: 'auto',
           compute: { module, entryPoint: 'main' },
         });
@@ -858,7 +879,7 @@ export class RadiantComputeEngine {
 
     // Explicit BindGroupLayouts with hasDynamicOffset=true on binding 0 for single-encoder ring dispatch!
     const mkDynamicPipe = (code: string, storageEntries: { binding: number; type: GPUBufferBindingType }[]) => {
-      const bgl = this.device.createBindGroupLayout({
+      const bgl = device.createBindGroupLayout({
         entries: [
           {
             binding: 0,
@@ -872,9 +893,9 @@ export class RadiantComputeEngine {
           })),
         ],
       });
-      const layout = this.device.createPipelineLayout({ bindGroupLayouts: [bgl] });
-      const module = this.device.createShaderModule({ code });
-      return this.device.createComputePipeline({
+      const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+      const module = device.createShaderModule({ code });
+      return device.createComputePipeline({
         layout,
         compute: { module, entryPoint: 'main' },
       });
@@ -928,7 +949,7 @@ export class RadiantComputeEngine {
     ]);
 
     void mk;
-    this.paramsRingBuf = this.device.createBuffer({
+    this.paramsRingBuf = device.createBuffer({
       size: this.PARAM_STRIDE_BYTES * this.MAX_PARAM_SLOTS,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -1048,6 +1069,11 @@ export class RadiantComputeEngine {
       finalNormW, head1W, head1B, head2W, head2B,
     };
 
+    if (this.isCPUFallback || !this.device) {
+      this.cpuWeightsF32 = unpackRDGIWeightsF32(buffer);
+      return;
+    }
+
     const payloadBytes = new Uint8Array(buffer, 64);
     if (this.weightsBuf) this.weightsBuf.destroy();
     this.weightsBuf = this.device.createBuffer({
@@ -1061,9 +1087,10 @@ export class RadiantComputeEngine {
   }
 
   private _rebuildBindGroups(): void {
-    if (!this.weightsBuf || this.maxTokens === 0) return;
+    if (!this.device || !this.weightsBuf || this.maxTokens === 0) return;
+    const device = this.device;
     const bg = (pipe: GPUComputePipeline, entries: GPUBuffer[]) =>
-      this.device.createBindGroup({
+      device.createBindGroup({
         layout: pipe.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: this.paramsRingBuf, offset: 0, size: 32 } },
@@ -1098,12 +1125,13 @@ export class RadiantComputeEngine {
   }
 
   private _ensureCapacity(nTokens: number): void {
-    if (nTokens <= this.maxTokens) return;
+    if (!this.device || nTokens <= this.maxTokens) return;
+    const device = this.device;
     const cap = Math.max(nTokens, 1024);
     const { dModel, nHeads, dFF } = this.header;
 
     const mkBuf = (floats: number, extraUsage = 0) =>
-      this.device.createBuffer({
+      device.createBuffer({
         size: Math.max(16, floats * 4),
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | extraUsage,
       });
@@ -1138,7 +1166,7 @@ export class RadiantComputeEngine {
     this.attnMergedBuf = mkBuf(cap * dModel);
     this.rawHeadBuf = mkBuf(cap * SH_STRIDE);
     this.shOutBuf = mkBuf(cap * SH_STRIDE);
-    this.readbackBuf = this.device.createBuffer({
+    this.readbackBuf = device.createBuffer({
       size: cap * SH_STRIDE * 4,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
@@ -1167,6 +1195,19 @@ export class RadiantComputeEngine {
     try {
       const nTokens = Math.floor(tokens.length / TOKEN_STRIDE);
       if (nTokens <= 0) return new Float32Array(0);
+      if (this.isCPUFallback || !this.device) {
+        if (!this.cpuWeightsF32) return new Float32Array(nTokens * SH_STRIDE);
+        const t0 = performance.now();
+        const result = await runRadiantCPU(tokens, nTokens, this.header, this.cpuWeightsF32, this.layout);
+        this.lastComputeMs = performance.now() - t0;
+        this.activeTokenCount = nTokens;
+        this.lastLocalSH = result;
+        this.lastWorldTokens = new Float32Array(tokens.subarray(0, nTokens * TOKEN_STRIDE));
+        if (updateWorldStorage) {
+          this.uploadWorldSHToTSL(tokens, result, nTokens);
+        }
+        return result;
+      }
       if (!this.weightsBuf) return new Float32Array(nTokens * SH_STRIDE);
       this._ensureCapacity(nTokens);
 
@@ -1396,6 +1437,7 @@ export class RadiantComputeEngine {
     }
 
     this.worldPatchStorage.needsUpdate = true;
+    this.worldPatchTexture.needsUpdate = true;
   }
 
   public getPatchOffsetForObject(objectId: number): number {
