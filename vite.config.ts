@@ -9,7 +9,7 @@ function copyRadiantRuntimeAssets(): Plugin {
       const root = process.cwd();
       const outDir = resolve(root, 'dist');
       const runtimeFiles = [
-        'artifacts/radiant_gi_fp16.bin',
+        'artifacts/radiant_gi_q8.bin',
         'data/parity_probes.json',
       ];
       for (const rel of runtimeFiles) {

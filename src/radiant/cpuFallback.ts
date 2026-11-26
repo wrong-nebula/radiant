@@ -44,6 +44,135 @@ export function unpackRDGIWeightsF32(buffer: ArrayBuffer): Float32Array {
   return out;
 }
 
+/**
+ * Unpack `RDG8` v2 (per-row symmetric INT8 + FP32 aux) into the exact same canonical
+ * dequantized FP32 layout used by `runRadiantCPU`, so Firefox/WebGL2 also benefits from
+ * the 2x smaller 6.76 MB `radiant_gi_q8.bin` download!
+ */
+export function unpackRDG8ToCanonicalF32(
+  buffer: ArrayBuffer,
+  header: RDGIHeader,
+  q8U32Len: number,
+  f32Len: number,
+): { weights: Float32Array; layout: CPUWeightLayout } {
+  const { dModel, nHeads, nLayers, dFF } = header;
+  const q8Bytes = new Int8Array(buffer, 64, q8U32Len * 4);
+  const f32Aux = new Float32Array(buffer, 64 + q8U32Len * 4, f32Len);
+
+  // Allocate canonical float array matching RDGI layout
+  let totalElems = dModel * 13 + dModel + dModel * dModel + dModel;
+  const qkvRows = nHeads * 78;
+  totalElems +=
+    nLayers *
+    (dModel + qkvRows * dModel + qkvRows + dModel * dModel + dModel + dModel + dFF * dModel + dFF + dModel * dFF + dModel);
+  totalElems += dModel + dModel * dModel + dModel + 12 * dModel + 12;
+
+  const out = new Float32Array(totalElems);
+  let outPos = 0;
+  let q8Pos = 0;
+  let auxPos = 0;
+
+  const alloc = (count: number): number => {
+    const u32Off = outPos >> 1;
+    outPos += count;
+    return u32Off;
+  };
+  const copyAux = (count: number): number => {
+    const off = alloc(count);
+    out.set(f32Aux.subarray(auxPos, auxPos + count), off * 2);
+    auxPos += count;
+    return off;
+  };
+  const deqMat = (rows: number, cols: number): { wOff: number; bOff: number } => {
+    const wOff = alloc(rows * cols);
+    const bOff = alloc(rows);
+    const scales = f32Aux.subarray(auxPos, auxPos + rows);
+    auxPos += rows;
+    out.set(f32Aux.subarray(auxPos, auxPos + rows), bOff * 2);
+    auxPos += rows;
+    const dstBase = wOff * 2;
+    const inv127 = 1.0 / 127.0;
+    for (let r = 0; r < rows; r++) {
+      const s = scales[r] * inv127;
+      const rDst = dstBase + r * cols;
+      for (let c = 0; c < cols; c++) {
+        out[rDst + c] = q8Bytes[q8Pos++] * s;
+      }
+    }
+    return { wOff, bOff };
+  };
+
+  const stem1W = copyAux(dModel * 13);
+  const stem1B = copyAux(dModel);
+  const stem2 = deqMat(dModel, dModel);
+
+  const layers: CPULayerOffsets[] = [];
+  for (let l = 0; l < nLayers; l++) {
+    const norm1W = copyAux(dModel);
+    // Unpack fused QKV+Geo [624, dModel] into 5 slices matching CPULayerOffsets
+    const qkvScales = f32Aux.subarray(auxPos, auxPos + qkvRows);
+    auxPos += qkvRows;
+    const qkvBias = f32Aux.subarray(auxPos, auxPos + qkvRows);
+    auxPos += qkvRows;
+
+    const sliceMat = (rows: number, rowStart: number): { wOff: number; bOff: number } => {
+      const wOff = alloc(rows * dModel);
+      const bOff = alloc(rows);
+      out.set(qkvBias.subarray(rowStart, rowStart + rows), bOff * 2);
+      const dstBase = wOff * 2;
+      const inv127 = 1.0 / 127.0;
+      for (let r = 0; r < rows; r++) {
+        const s = qkvScales[rowStart + r] * inv127;
+        const rDst = dstBase + r * dModel;
+        for (let c = 0; c < dModel; c++) {
+          out[rDst + c] = q8Bytes[q8Pos++] * s;
+        }
+      }
+      return { wOff, bOff };
+    };
+
+    const qSem = sliceMat(nHeads * 19, 0);
+    const kSem = sliceMat(nHeads * 19, nHeads * 19);
+    const vInv = sliceMat(nHeads * 26, nHeads * 38);
+    const geoQ = sliceMat(nHeads * 7, nHeads * 64);
+    const geoK = sliceMat(nHeads * 7, nHeads * 71);
+    const wO = deqMat(dModel, dModel);
+    const norm2W = copyAux(dModel);
+    const fc1 = deqMat(dFF, dModel);
+    const fc2 = deqMat(dModel, dFF);
+
+    layers.push({
+      norm1W,
+      qSemW: qSem.wOff, qSemB: qSem.bOff,
+      kSemW: kSem.wOff, kSemB: kSem.bOff,
+      vInvW: vInv.wOff, vInvB: vInv.bOff,
+      geoQW: geoQ.wOff, geoQB: geoQ.bOff,
+      geoKW: geoK.wOff, geoKB: geoK.bOff,
+      wOW: wO.wOff, wOB: wO.bOff,
+      norm2W,
+      fc1W: fc1.wOff, fc1B: fc1.bOff,
+      fc2W: fc2.wOff, fc2B: fc2.bOff,
+    });
+  }
+
+  const finalNormW = copyAux(dModel);
+  const head1 = deqMat(dModel, dModel);
+  const head2W = copyAux(12 * dModel);
+  const head2B = copyAux(12);
+
+  return {
+    weights: out,
+    layout: {
+      stem1W, stem1B,
+      stem2W: stem2.wOff, stem2B: stem2.bOff,
+      layers,
+      finalNormW,
+      head1W: head1.wOff, head1B: head1.bOff,
+      head2W, head2B,
+    },
+  };
+}
+
 function geluTanh(x: number): number {
   const arg = Math.max(-15.0, Math.min(15.0, 0.7978845608028654 * (x + 0.044715 * x * x * x)));
   return 0.5 * x * (1.0 + Math.tanh(arg));

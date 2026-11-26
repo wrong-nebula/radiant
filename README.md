@@ -4,16 +4,16 @@
 
 **[Launch Live WebGPU Demo](https://wrong-nebula.github.io/radiant/)** *(requires a WebGPU-enabled browser such as Chrome, Edge, or Safari 18+)*
 
-Based on **RADIANT** (*Object-Centric Feed-Forward Global Illumination*, `arXiv:2610.32075v1`), trained end-to-end on Google Colab GPU with NVIDIA Warp 3-bounce GPU patch path tracing and BF16 $SE(3)$-Invariant Form-Factor Attention, and deployed as a compact (`13.18 MB`, FP16 `RDGI`) pure-WebGPU WGSL Compute + `three/tsl` runtime running natively in the browser at 60 fps (`0 ms` when static).
+Based on **RADIANT** (*Object-Centric Feed-Forward Global Illumination*, `arXiv:2610.32075v1`), trained end-to-end on Google Colab GPU with NVIDIA Warp 3-bounce GPU patch path tracing and BF16 $SE(3)$-Invariant Form-Factor Attention, and deployed as a compact (`6.76 MB` INT8 `RDG8` / `13.18 MB` FP16 `RDGI`) pure-WebGPU WGSL Compute + `three/tsl` runtime running natively in the browser at 60 fps (`0 ms` when static).
 
 ![Cornell Color-Bleed Box](artifacts/playwright_audit/01_cornell_radiant_gi.png)
 ![Vaulted Brutalist Gallery](artifacts/playwright_audit/07_vaulted_gallery.png)
 
-## Highlights (v2)
+## Highlights (v2.5 Turbo)
 
 - **Zero-Bake 3-Bounce Indirect GI:** Drag any wall, partition, sculpture, or area lamp live — or drop in any textured `.glb` — for instant 32-patch surface tokenization, 3-bounce color bleed, dynamic doorway occlusion, and Order-1 SH directional diffuse + glossy specular indirect bounce light.
-- **Native Pure-WebGPU Compute Transformer:** 9-layer `d_model=256`, 8-head $SE(3)$-Invariant Form-Factor Transformer (`6.91M` params, `13.18 MB` FP16) running in block-tiled `vec4` WGSL FlashAttention shaders (`41.8–51.1 ms` per dirty recompute on Apple M1 Metal 3, `60.7` steady / `62.2` live-drag fps, `1.0e-6` RMSE bit-parity vs. PyTorch FP16).
-- **Verified Zero-Shot Fidelity (`O1`–`O5`):** `30.71 dB` tone-mapped PSNR (`31.27 dB` Cornell, `32.11 dB` Vaulted Atrium), `r = 0.9954` color-bleed spatial correlation, `2.6e-6` $SE(3)$ invariance drift, and `96.3%` vs. `95.5%` dynamic occlusion accuracy across `256` strictly unseen held-out rooms traced at `1,024` spp.
+- **Native Pure-WebGPU Turbo Compute Transformer:** 9-layer `d_model=256`, 8-head $SE(3)$-Invariant Form-Factor Transformer (`6.91M` params, `6.76 MB` fused-QKV INT8 `RDG8`) running in coalesced 2D register-blocked `shader-f16` + `unpack4x8snorm` WGSL shaders with zero-readback GPU-to-GPU World SH packing (**`14.8 ms`** pure compute min / **`17.2–23.7 ms`** live alongside 60 fps 3D rendering on Apple M1 Metal 3 — **~8–12× faster than v1**, `60.6` steady / `61.6` live-drag fps, `0.00114` RMSE vs. PyTorch FP16).
+- **Verified Zero-Shot Fidelity (`O1`–`O5`):** `30.71 dB` tone-mapped PSNR (`30.710 dB` INT8 / `30.712 dB` FP16; `31.27 dB` Cornell, `32.11 dB` Vaulted Atrium), `r = 0.9954` color-bleed spatial correlation, `2.6e-6` $SE(3)$ invariance drift, and `96.3%` vs. `95.5%` dynamic occlusion accuracy across `256` strictly unseen held-out rooms traced at `1,024` spp.
 
 ## Quick Start
 

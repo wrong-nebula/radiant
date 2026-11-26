@@ -35,6 +35,7 @@ import {
   reflect,
   screenUV,
   smoothstep,
+  sqrt,
   storage,
   texture,
   textureLoad,
@@ -94,7 +95,10 @@ export function buildRadiantGINode(
     const reflDir = reflect(viewDir.negate(), wn).normalize();
 
     const accumDiff = vec3(0.0, 0.0, 0.0).toVar();
-    const accumSpec = vec3(0.0, 0.0, 0.0).toVar();
+    const accumI0 = vec3(0.0, 0.0, 0.0).toVar();
+    const accumI1R = vec3(0.0, 0.0, 0.0).toVar();
+    const accumI1G = vec3(0.0, 0.0, 0.0).toVar();
+    const accumI1B = vec3(0.0, 0.0, 0.0).toVar();
     const accumErr = float(0.0).toVar();
     const accumW = float(0.0).toVar();
 
@@ -127,60 +131,55 @@ export function buildRadiantGINode(
       const pRad = max(p0.w, 0.16);
       const pN = p1.xyz;
 
-      // 1. Adaptive spatial Gaussian weight
+      // 1. Fused spatial Gaussian + tangent-plane penalty: exp(-a) * exp(-b) == exp(-(a + b)) (half the exp() ops!)
       const diff = wp.sub(pPos);
       const dist2 = dot(diff, diff);
       const sigma2 = pRad.mul(pRad).mul(3.0).add(0.06);
-      const wDist = exp(dist2.negate().div(sigma2));
-
-      // 2. Crease-safe softened normal gate: blocks 90-deg bleed while keeping curved columns & thin bevels smooth!
-      const ndot = max(dot(wn, pN), 0.0);
-      const wNorm = pow(max(ndot, float(1e-4)), float(2.5))
-        .mul(smoothstep(float(0.0), float(0.02), ndot))
-        .add(smoothstep(float(0.02), float(0.35), ndot).mul(0.025));
-
-      // 3. Tangent-plane distance penalty (prevents light leaking across thin walls)
       const planeDist = dot(diff, pN);
-      const wPlane = exp(planeDist.mul(planeDist).negate().div(0.14));
+      const wSpatial = exp(dist2.div(sigma2).add(planeDist.mul(planeDist).div(0.14)).negate());
 
-      const w = wDist.mul(wNorm).mul(wPlane).add(1e-7);
+      // 2. Crease-safe softened normal gate: ndot^2.5 == ndot * ndot * sqrt(ndot) (zero pow() inside loop!)
+      const ndot = max(dot(wn, pN), 0.0);
+      const wNorm = ndot.mul(ndot).mul(sqrt(ndot)).add(smoothstep(float(0.02), float(0.35), ndot).mul(0.025));
+
+      const w = wSpatial.mul(wNorm).add(1e-7);
 
       // Exact Order-1 SH directional diffuse irradiance at shading normal wn:
       const i0 = p2.xyz;
       const inVec = vec3(p2.w, p3.w, p4.w);
       const proj1 = vec3(dot(p3.xyz, wn), dot(p4.xyz, wn), dot(p5.xyz, wn));
-      const twoMinusC = float(2.0).sub(clamp(dot(wn, pN), 0.0, 1.0));
+      const twoMinusC = float(2.0).sub(clamp(ndot, 0.0, 1.0));
       const irrPatch = max(
         i0.mul(twoMinusC).add(proj1.sub(inVec).mul(1.5)),
         vec3(0.0, 0.0, 0.0),
       );
 
-      // Directional glossy specular indirect bounce from world-space L1 SH dominant vectors!
-      const lenR = max(length(p3.xyz), 1e-4);
-      const lenG = max(length(p4.xyz), 1e-4);
-      const lenB = max(length(p5.xyz), 1e-4);
-      const dirR = p3.xyz.div(lenR);
-      const dirG = p4.xyz.div(lenG);
-      const dirB = p5.xyz.div(lenB);
-      const lobeR = pow(max(dot(reflDir, dirR), float(1e-4)), specExp);
-      const lobeG = pow(max(dot(reflDir, dirG), float(1e-4)), specExp);
-      const lobeB = pow(max(dot(reflDir, dirB), float(1e-4)), specExp);
-      const specPatch = vec3(
-        i0.x.mul(lobeR),
-        i0.y.mul(lobeG),
-        i0.z.mul(lobeB),
-      ).mul(specNorm).mul(float(0.32));
-
       accumDiff.addAssign(irrPatch.mul(w));
-      accumSpec.addAssign(specPatch.mul(w));
+      accumI0.addAssign(i0.mul(w));
+      accumI1R.addAssign(p3.xyz.mul(w));
+      accumI1G.addAssign(p4.xyz.mul(w));
+      accumI1B.addAssign(p5.xyz.mul(w));
       accumErr.addAssign(p5.w.mul(w));
       accumW.addAssign(w);
     });
 
     const invW = float(1.0).div(max(accumW, 1e-6));
     const diffIrr = accumDiff.mul(invW);
-    const specIrr = accumSpec.mul(invW);
+    const meanI0 = accumI0.mul(invW);
     const err = accumErr.mul(invW);
+
+    // Evaluate directional glossy specular lobe ONCE per pixel (32x fewer pow()/sqrt() ops!)
+    const dirR = accumI1R.div(max(length(accumI1R), 1e-4));
+    const dirG = accumI1G.div(max(length(accumI1G), 1e-4));
+    const dirB = accumI1B.div(max(length(accumI1B), 1e-4));
+    const lobeR = pow(max(dot(reflDir, dirR), float(1e-4)), specExp);
+    const lobeG = pow(max(dot(reflDir, dirG), float(1e-4)), specExp);
+    const lobeB = pow(max(dot(reflDir, dirB), float(1e-4)), specExp);
+    const specIrr = vec3(
+      meanI0.x.mul(lobeR),
+      meanI0.y.mul(lobeG),
+      meanI0.z.mul(lobeB),
+    ).mul(specNorm).mul(float(0.32));
 
     const glossyWeight = mix(float(1.0).sub(roughF).mul(0.55), float(0.85), metalF);
     return {

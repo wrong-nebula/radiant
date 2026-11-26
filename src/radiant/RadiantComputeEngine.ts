@@ -15,7 +15,14 @@ import {
   SH_STRIDE,
   TOKEN_STRIDE,
 } from './shMath.ts';
-import { runRadiantCPU, unpackRDGIWeightsF32 } from './cpuFallback.ts';
+import { runRadiantCPU, unpackRDG8ToCanonicalF32, unpackRDGIWeightsF32 } from './cpuFallback.ts';
+import {
+  WGSL_BUILD_SE3_QKV_FUSED,
+  WGSL_LINEAR_F32,
+  WGSL_PACK_WORLD_SH,
+  WGSL_RMS_NORM_F32,
+  buildLinearQ8WGSL,
+} from './wgslTurboQ8.ts';
 
 export interface RDGIHeader {
   version: number;
@@ -47,6 +54,24 @@ interface WeightLayout {
   layers: LayerOffsets[];
   finalNormW: number;
   head1W: number; head1B: number;
+  head2W: number; head2B: number;
+}
+
+interface Q8LayerOffsets {
+  norm1W: number;
+  qkvW: number; qkvS: number; qkvB: number;
+  wOW: number; wOS: number; wOB: number;
+  norm2W: number;
+  fc1W: number; fc1S: number; fc1B: number;
+  fc2W: number; fc2S: number; fc2B: number;
+}
+
+interface Q8WeightLayout {
+  stem1W: number; stem1B: number;
+  stem2W: number; stem2S: number; stem2B: number;
+  layers: Q8LayerOffsets[];
+  finalNormW: number;
+  head1W: number; head1S: number; head1B: number;
   head2W: number; head2B: number;
 }
 
@@ -595,20 +620,31 @@ fn main(
           l_sum = 1.0;
           a0 = V_tile[tb + 0u]; a1 = V_tile[tb + 1u]; a2 = V_tile[tb + 2u]; a3 = V_tile[tb + 3u];
           a4 = V_tile[tb + 4u]; a5 = V_tile[tb + 5u]; a6 = V_tile[tb + 6u]; a7 = V_tile[tb + 7u];
+        } else if (score <= m_max) {
+          // Fast path (>95% of keys): single exp(), ZERO rescale multiplies on a0..a7!
+          let w = exp(max(score - m_max, -80.0));
+          l_sum += w;
+          a0 += V_tile[tb + 0u] * w;
+          a1 += V_tile[tb + 1u] * w;
+          a2 += V_tile[tb + 2u] * w;
+          a3 += V_tile[tb + 3u] * w;
+          a4 += V_tile[tb + 4u] * w;
+          a5 += V_tile[tb + 5u] * w;
+          a6 += V_tile[tb + 6u] * w;
+          a7 += V_tile[tb + 7u] * w;
         } else {
-          let new_m = max(m_max, score);
-          let rescale = exp(max(m_max - new_m, -80.0));
-          let w = exp(max(score - new_m, -80.0));
-          l_sum = l_sum * rescale + w;
-          a0 = a0 * rescale + V_tile[tb + 0u] * w;
-          a1 = a1 * rescale + V_tile[tb + 1u] * w;
-          a2 = a2 * rescale + V_tile[tb + 2u] * w;
-          a3 = a3 * rescale + V_tile[tb + 3u] * w;
-          a4 = a4 * rescale + V_tile[tb + 4u] * w;
-          a5 = a5 * rescale + V_tile[tb + 5u] * w;
-          a6 = a6 * rescale + V_tile[tb + 6u] * w;
-          a7 = a7 * rescale + V_tile[tb + 7u] * w;
-          m_max = new_m;
+          // New max (<5% of keys): single exp(), w == 1.0!
+          let rescale = exp(max(m_max - score, -80.0));
+          l_sum = l_sum * rescale + 1.0;
+          a0 = a0 * rescale + V_tile[tb + 0u];
+          a1 = a1 * rescale + V_tile[tb + 1u];
+          a2 = a2 * rescale + V_tile[tb + 2u];
+          a3 = a3 * rescale + V_tile[tb + 3u];
+          a4 = a4 * rescale + V_tile[tb + 4u];
+          a5 = a5 * rescale + V_tile[tb + 5u];
+          a6 = a6 * rescale + V_tile[tb + 6u];
+          a7 = a7 * rescale + V_tile[tb + 7u];
+          m_max = score;
         }
       }
     }
@@ -719,13 +755,18 @@ export class RadiantComputeEngine {
   public isCPUFallback: boolean;
   /** True whenever the Three.js renderer is using WebGLBackend (must read DataTexture, not storage()). */
   public readonly useTextureLookup: boolean;
+  public isQ8Turbo = false;
+  public hasF16 = false;
+  private rendererBackend: any = null;
   public header!: RDGIHeader;
   private layout!: WeightLayout;
+  private q8Layout: Q8WeightLayout | null = null;
   private weightsBuf: GPUBuffer | null = null;
+  private f32AuxBuf: GPUBuffer | null = null;
   private cpuWeightsF32: Float32Array | null = null;
   private rawWeightsBuffer: ArrayBuffer | null = null;
 
-  // Compute pipelines
+  // Compute pipelines (RDGI FP16 + RDG8 Turbo INT8 + On-GPU World SH Packer)
   private pipeCentroid!: GPUComputePipeline;
   private pipePrep!: GPUComputePipeline;
   private pipeRMS!: GPUComputePipeline;
@@ -734,6 +775,11 @@ export class RadiantComputeEngine {
   private pipeBuildV!: GPUComputePipeline;
   private pipeAttn!: GPUComputePipeline;
   private pipeDecode!: GPUComputePipeline;
+  private pipeRMSF32!: GPUComputePipeline;
+  private pipeLinearF32!: GPUComputePipeline;
+  private pipeLinearQ8!: GPUComputePipeline;
+  private pipeBuildQKVFused!: GPUComputePipeline;
+  private pipePackWorldSH!: GPUComputePipeline;
 
   // Dynamic capacity workspace buffers
   private maxTokens = 0;
@@ -745,6 +791,7 @@ export class RadiantComputeEngine {
   private xBBuf!: GPUBuffer;
   private xNormBuf!: GPUBuffer;
   private ffnBuf!: GPUBuffer;
+  private qkvGeoBuf!: GPUBuffer;
   private qSemBuf!: GPUBuffer;
   private kSemBuf!: GPUBuffer;
   private vInvBuf!: GPUBuffer;
@@ -756,6 +803,7 @@ export class RadiantComputeEngine {
   private attnMergedBuf!: GPUBuffer;
   private rawHeadBuf!: GPUBuffer;
   private shOutBuf!: GPUBuffer;
+  private worldPatchGpuBuf!: GPUBuffer;
   private readbackBuf!: GPUBuffer;
   private paramsRingBuf!: GPUBuffer;
 
@@ -796,15 +844,30 @@ export class RadiantComputeEngine {
     head1: GPUBindGroup;
     head2: GPUBindGroup;
     decode: GPUBindGroup;
+    packWorldSH: GPUBindGroup;
+    // RDG8 Turbo Q8 bind groups
+    q8Stem1?: GPUBindGroup;
+    q8Stem2?: GPUBindGroup;
+    q8RmsX?: GPUBindGroup;
+    q8QkvGeo?: GPUBindGroup;
+    q8BuildQKV?: GPUBindGroup;
+    q8WO?: GPUBindGroup;
+    q8RmsXB?: GPUBindGroup;
+    q8Fc1?: GPUBindGroup;
+    q8Fc2?: GPUBindGroup;
+    q8Head1?: GPUBindGroup;
+    q8Head2?: GPUBindGroup;
   } | null = null;
 
   private isBusy = false;
   private inferQueue: Promise<unknown> = Promise.resolve();
 
-  constructor(device: GPUDevice | null, useTextureLookup = false) {
+  constructor(device: GPUDevice | null, useTextureLookup = false, rendererBackend: any = null) {
     this.device = device;
     this.isCPUFallback = device === null;
     this.useTextureLookup = useTextureLookup || device === null;
+    this.rendererBackend = rendererBackend;
+    this.hasF16 = Boolean(device && device.features && device.features.has('shader-f16'));
     this.worldPatchStorage = new THREE.StorageBufferAttribute(this.worldPatchArray, 4);
     this.worldPatchTexture = new THREE.DataTexture(
       this.worldPatchArray,
@@ -838,13 +901,15 @@ export class RadiantComputeEngine {
       try {
         const adapter = await navigator.gpu.requestAdapter();
         if (adapter) {
-          device = await adapter.requestDevice();
+          const reqFeatures: GPUFeatureName[] = [];
+          if (adapter.features.has('shader-f16')) reqFeatures.push('shader-f16');
+          device = await adapter.requestDevice({ requiredFeatures: reqFeatures });
         }
       } catch {
         device = null;
       }
     }
-    return new RadiantComputeEngine(device, isWebGLRenderer);
+    return new RadiantComputeEngine(device, isWebGLRenderer, backend);
   }
 
   public static async createFromRenderer(
@@ -958,6 +1023,36 @@ export class RadiantComputeEngine {
       { binding: 1, type: 'read-only-storage' },
       { binding: 2, type: 'storage' },
     ]);
+    this.pipeRMSF32 = mkDynamicPipe(WGSL_RMS_NORM_F32, [
+      { binding: 1, type: 'read-only-storage' },
+      { binding: 2, type: 'read-only-storage' },
+      { binding: 3, type: 'storage' },
+    ]);
+    this.pipeLinearF32 = mkDynamicPipe(WGSL_LINEAR_F32, [
+      { binding: 1, type: 'read-only-storage' },
+      { binding: 2, type: 'read-only-storage' },
+      { binding: 3, type: 'read-only-storage' },
+      { binding: 4, type: 'storage' },
+    ]);
+    this.pipeLinearQ8 = mkDynamicPipe(buildLinearQ8WGSL(this.hasF16), [
+      { binding: 1, type: 'read-only-storage' },
+      { binding: 2, type: 'read-only-storage' },
+      { binding: 3, type: 'read-only-storage' },
+      { binding: 4, type: 'read-only-storage' },
+      { binding: 5, type: 'storage' },
+    ]);
+    this.pipeBuildQKVFused = mkDynamicPipe(WGSL_BUILD_SE3_QKV_FUSED, [
+      { binding: 1, type: 'read-only-storage' },
+      { binding: 2, type: 'read-only-storage' },
+      { binding: 3, type: 'storage' },
+      { binding: 4, type: 'storage' },
+      { binding: 5, type: 'storage' },
+    ]);
+    this.pipePackWorldSH = mkDynamicPipe(WGSL_PACK_WORLD_SH, [
+      { binding: 1, type: 'read-only-storage' },
+      { binding: 2, type: 'read-only-storage' },
+      { binding: 3, type: 'storage' },
+    ]);
 
     void mk;
     this.paramsRingBuf = device.createBuffer({
@@ -1009,9 +1104,16 @@ export class RadiantComputeEngine {
       String.fromCharCode(dv.getUint8(1)) +
       String.fromCharCode(dv.getUint8(2)) +
       String.fromCharCode(dv.getUint8(3));
-    if (magic !== 'RDGI') {
-      throw new Error(`Invalid RDGI weight binary magic: "${magic}"`);
+
+    if (magic === 'RDG8') {
+      this._loadRDG8Buffer(buffer, dv);
+      return;
     }
+    if (magic !== 'RDGI') {
+      throw new Error(`Invalid RDGI/RDG8 weight binary magic: "${magic}"`);
+    }
+    this.isQ8Turbo = false;
+    this.q8Layout = null;
 
     this.header = {
       version: dv.getUint32(4, true),
@@ -1098,6 +1200,109 @@ export class RadiantComputeEngine {
     this._rebuildBindGroups();
   }
 
+  private _loadRDG8Buffer(buffer: ArrayBuffer, dv: DataView): void {
+    this.isQ8Turbo = true;
+    const q8U32Len = dv.getUint32(24, true);
+    const f32Len = dv.getUint32(28, true);
+    this.header = {
+      version: dv.getUint32(4, true),
+      dModel: dv.getUint32(8, true),
+      nHeads: dv.getUint32(12, true),
+      nLayers: dv.getUint32(16, true),
+      dFF: dv.getUint32(20, true),
+      nTensors: q8U32Len,
+      flags: 8,
+      posScale: dv.getFloat32(32, true),
+    };
+
+    const expectedBytes = 64 + q8U32Len * 4 + f32Len * 4;
+    if (buffer.byteLength !== expectedBytes) {
+      throw new Error(`RDG8 size mismatch: got ${buffer.byteLength}, expected ${expectedBytes}`);
+    }
+
+    const { dModel, nHeads, nLayers, dFF } = this.header;
+    const qkvRows = nHeads * 78;
+    let q8Off = 0;
+    let auxOff = 0;
+    const allocQ8 = (rows: number, cols: number): number => {
+      const off = q8Off;
+      q8Off += (rows * cols) >> 2;
+      return off;
+    };
+    const allocAux = (count: number): number => {
+      const off = auxOff;
+      auxOff += count;
+      return off;
+    };
+
+    const stem1W = allocAux(dModel * 13);
+    const stem1B = allocAux(dModel);
+    const stem2W = allocQ8(dModel, dModel);
+    const stem2S = allocAux(dModel);
+    const stem2B = allocAux(dModel);
+
+    const layers: Q8LayerOffsets[] = [];
+    for (let l = 0; l < nLayers; l++) {
+      const norm1W = allocAux(dModel);
+      const qkvW = allocQ8(qkvRows, dModel);
+      const qkvS = allocAux(qkvRows);
+      const qkvB = allocAux(qkvRows);
+      const wOW = allocQ8(dModel, dModel);
+      const wOS = allocAux(dModel);
+      const wOB = allocAux(dModel);
+      const norm2W = allocAux(dModel);
+      const fc1W = allocQ8(dFF, dModel);
+      const fc1S = allocAux(dFF);
+      const fc1B = allocAux(dFF);
+      const fc2W = allocQ8(dModel, dFF);
+      const fc2S = allocAux(dModel);
+      const fc2B = allocAux(dModel);
+      layers.push({ norm1W, qkvW, qkvS, qkvB, wOW, wOS, wOB, norm2W, fc1W, fc1S, fc1B, fc2W, fc2S, fc2B });
+    }
+
+    const finalNormW = allocAux(dModel);
+    const head1W = allocQ8(dModel, dModel);
+    const head1S = allocAux(dModel);
+    const head1B = allocAux(dModel);
+    const head2W = allocAux(12 * dModel);
+    const head2B = allocAux(12);
+
+    if (q8Off !== q8U32Len || auxOff !== f32Len) {
+      throw new Error(`RDG8 offset mismatch: q8=${q8Off}/${q8U32Len}, aux=${auxOff}/${f32Len}`);
+    }
+
+    this.q8Layout = {
+      stem1W, stem1B, stem2W, stem2S, stem2B, layers,
+      finalNormW, head1W, head1S, head1B, head2W, head2B,
+    };
+
+    this.rawWeightsBuffer = buffer;
+    if (this.isCPUFallback || !this.device) {
+      const unpacked = unpackRDG8ToCanonicalF32(buffer, this.header, q8U32Len, f32Len);
+      this.cpuWeightsF32 = unpacked.weights;
+      this.layout = unpacked.layout;
+      return;
+    }
+
+    const q8Bytes = new Uint8Array(buffer, 64, q8U32Len * 4);
+    const auxBytes = new Uint8Array(buffer, 64 + q8U32Len * 4, f32Len * 4);
+    if (this.weightsBuf) this.weightsBuf.destroy();
+    if (this.f32AuxBuf) this.f32AuxBuf.destroy();
+    this.weightsBuf = this.device.createBuffer({
+      size: q8Bytes.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.f32AuxBuf = this.device.createBuffer({
+      size: auxBytes.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(this.weightsBuf, 0, q8Bytes);
+    this.device.queue.writeBuffer(this.f32AuxBuf, 0, auxBytes);
+    this.cachedBGs = null;
+    this._ensureCapacity(MAX_RENDER_PATCHES);
+    this._rebuildBindGroups();
+  }
+
   private _rebuildBindGroups(): void {
     if (!this.device || !this.weightsBuf || this.maxTokens === 0) return;
     const device = this.device;
@@ -1133,7 +1338,22 @@ export class RadiantComputeEngine {
       head1: bg(this.pipeLinear, [this.xNormBuf, this.weightsBuf, this.centroidBuf, this.xBBuf]),
       head2: bg(this.pipeLinear, [this.xBBuf, this.weightsBuf, this.centroidBuf, this.rawHeadBuf]),
       decode: bg(this.pipeDecode, [this.rawHeadBuf, this.shOutBuf]),
+      packWorldSH: bg(this.pipePackWorldSH, [this.tokensBuf, this.shOutBuf, this.worldPatchGpuBuf]),
     };
+    if (this.isQ8Turbo && this.f32AuxBuf) {
+      const aux = this.f32AuxBuf;
+      this.cachedBGs.q8Stem1 = bg(this.pipeLinearF32, [this.intrBuf, aux, this.centroidBuf, this.xBBuf]);
+      this.cachedBGs.q8Stem2 = bg(this.pipeLinearQ8, [this.xBBuf, this.weightsBuf, aux, this.centroidBuf, this.xABuf]);
+      this.cachedBGs.q8RmsX = bg(this.pipeRMSF32, [this.xABuf, aux, this.xNormBuf]);
+      this.cachedBGs.q8QkvGeo = bg(this.pipeLinearQ8, [this.xNormBuf, this.weightsBuf, aux, this.centroidBuf, this.qkvGeoBuf]);
+      this.cachedBGs.q8BuildQKV = bg(this.pipeBuildQKVFused, [this.geoBuf, this.qkvGeoBuf, this.qBuf, this.kBuf, this.vBuf]);
+      this.cachedBGs.q8WO = bg(this.pipeLinearQ8, [this.attnMergedBuf, this.weightsBuf, aux, this.xABuf, this.xBBuf]);
+      this.cachedBGs.q8RmsXB = bg(this.pipeRMSF32, [this.xBBuf, aux, this.xNormBuf]);
+      this.cachedBGs.q8Fc1 = bg(this.pipeLinearQ8, [this.xNormBuf, this.weightsBuf, aux, this.centroidBuf, this.ffnBuf]);
+      this.cachedBGs.q8Fc2 = bg(this.pipeLinearQ8, [this.ffnBuf, this.weightsBuf, aux, this.xBBuf, this.xABuf]);
+      this.cachedBGs.q8Head1 = bg(this.pipeLinearQ8, [this.xNormBuf, this.weightsBuf, aux, this.centroidBuf, this.xBBuf]);
+      this.cachedBGs.q8Head2 = bg(this.pipeLinearF32, [this.xBBuf, aux, this.centroidBuf, this.rawHeadBuf]);
+    }
   }
 
   private _ensureCapacity(nTokens: number): void {
@@ -1150,10 +1370,10 @@ export class RadiantComputeEngine {
 
     for (const b of [
       this.tokensBuf, this.centroidBuf, this.geoBuf, this.intrBuf,
-      this.xABuf, this.xBBuf, this.xNormBuf, this.ffnBuf,
+      this.xABuf, this.xBBuf, this.xNormBuf, this.ffnBuf, this.qkvGeoBuf,
       this.qSemBuf, this.kSemBuf, this.vInvBuf, this.geoQBuf, this.geoKBuf,
       this.qBuf, this.kBuf, this.vBuf, this.attnMergedBuf,
-      this.rawHeadBuf, this.shOutBuf, this.readbackBuf,
+      this.rawHeadBuf, this.shOutBuf, this.worldPatchGpuBuf, this.readbackBuf,
     ]) {
       if (b) b.destroy();
     }
@@ -1167,6 +1387,7 @@ export class RadiantComputeEngine {
     this.xBBuf = mkBuf(cap * dModel);
     this.xNormBuf = mkBuf(cap * dModel);
     this.ffnBuf = mkBuf(cap * dFF);
+    this.qkvGeoBuf = mkBuf(cap * nHeads * 78);
     this.qSemBuf = mkBuf(cap * nHeads * 19);
     this.kSemBuf = mkBuf(cap * nHeads * 19);
     this.vInvBuf = mkBuf(cap * nHeads * 26);
@@ -1178,6 +1399,7 @@ export class RadiantComputeEngine {
     this.attnMergedBuf = mkBuf(cap * dModel);
     this.rawHeadBuf = mkBuf(cap * SH_STRIDE);
     this.shOutBuf = mkBuf(cap * SH_STRIDE);
+    this.worldPatchGpuBuf = mkBuf(cap * WORLD_PATCH_VEC4S * 4);
     this.readbackBuf = device.createBuffer({
       size: cap * SH_STRIDE * 4,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -1186,15 +1408,19 @@ export class RadiantComputeEngine {
   }
 
   /**
-   * Run full 9-layer FP16 RADIANT SE(3) Form-Factor Transformer on GPU for `tokens` ([N * 21]).
-   * Serialized on an internal GPU queue so concurrent calls (e.g. live drag -> room switch)
-   * NEVER drop work or return a stale mismatched-length buffer from a previous room.
+   * Run full 9-layer RADIANT SE(3) Form-Factor Transformer on GPU (RDG8 Turbo INT8 or RDGI FP16).
+   * When `readback = false` and Three.js's WebGPU StorageBufferAttribute GPUBuffer is active,
+   * packs world-space SH directly on-GPU with ZERO `mapAsync` CPU readback stall!
    */
-  public inferTokens(tokens: Float32Array, updateWorldStorage = true): Promise<Float32Array> {
-    // Snapshot tokens before queueing so caller buffer mutations cannot race
+  public inferTokens(
+    tokens: Float32Array,
+    updateWorldStorage = true,
+    readback = true,
+  ): Promise<Float32Array> {
     const tokensSnap = new Float32Array(tokens);
-    const task = this.inferQueue.then(() => this._runInferTokens(tokensSnap, updateWorldStorage));
-    // Keep queue alive even if a single call rejects
+    const task = this.inferQueue.then(() =>
+      this._runInferTokens(tokensSnap, updateWorldStorage, readback),
+    );
     this.inferQueue = task.then(
       () => undefined,
       () => undefined,
@@ -1202,7 +1428,11 @@ export class RadiantComputeEngine {
     return task;
   }
 
-  private async _runInferTokens(tokens: Float32Array, updateWorldStorage: boolean): Promise<Float32Array> {
+  private async _runInferTokens(
+    tokens: Float32Array,
+    updateWorldStorage: boolean,
+    readback: boolean,
+  ): Promise<Float32Array> {
     this.isBusy = true;
     try {
       const nTokens = Math.floor(tokens.length / TOKEN_STRIDE);
@@ -1250,112 +1480,225 @@ export class RadiantComputeEngine {
       if (!this.cachedBGs) this._rebuildBindGroups();
       const bgs = this.cachedBGs!;
 
-      // Pre-record all parameter slots
-      const offCentroid = pushU32(nTokens, 0, 0, 0);
-      const offPrep = pushPrep(nTokens, posScale);
-      const offStem1 = pushU32(nTokens, 13, dModel, this.layout.stem1W, this.layout.stem1B, 1, 0, 0);
-      const offStem2 = pushU32(nTokens, dModel, dModel, this.layout.stem2W, this.layout.stem2B, 0, 0, 0);
-
-      const layerSlots = this.layout.layers.map((L) => ({
-        rms1: pushU32(nTokens, dModel, L.norm1W, 0),
-        qSem: pushU32(nTokens, dModel, nHeads * 19, L.qSemW, L.qSemB, 0, 0, 0),
-        kSem: pushU32(nTokens, dModel, nHeads * 19, L.kSemW, L.kSemB, 0, 0, 0),
-        vInv: pushU32(nTokens, dModel, nHeads * 26, L.vInvW, L.vInvB, 0, 0, 0),
-        geoQ: pushU32(nTokens, dModel, nHeads * 7, L.geoQW, L.geoQB, 0, 0, 0),
-        geoK: pushU32(nTokens, dModel, nHeads * 7, L.geoKW, L.geoKB, 0, 0, 0),
-        qkv: pushU32(nTokens, nHeads, 0, 0),
-        attn: pushU32(nTokens, nHeads, 0, 0),
-        wO: pushU32(nTokens, dModel, dModel, L.wOW, L.wOB, 0, 1, 0),
-        rms2: pushU32(nTokens, dModel, L.norm2W, 0),
-        fc1: pushU32(nTokens, dModel, dFF, L.fc1W, L.fc1B, 1, 0, 0),
-        fc2: pushU32(nTokens, dFF, dModel, L.fc2W, L.fc2B, 0, 1, 0),
-      }));
-
-      const offFinalNorm = pushU32(nTokens, dModel, this.layout.finalNormW, 0);
-      const offHead1 = pushU32(nTokens, dModel, dModel, this.layout.head1W, this.layout.head1B, 1, 0, 0);
-      const offHead2 = pushU32(nTokens, dModel, 12, this.layout.head2W, this.layout.head2B, 0, 0, 0);
-      const offDecode = pushU32(nTokens, 0, 0, 0);
-
-      // Single uniform ring upload!
-      this.device.queue.writeBuffer(this.paramsRingBuf, 0, this.paramsCPU.buffer, 0, slot * this.PARAM_STRIDE_BYTES);
+      // Check whether we can do zero-readback GPU-to-GPU World SH copy directly into Three.js StorageBufferAttribute!
+      const threeDstBuf: GPUBuffer | undefined =
+        updateWorldStorage && !readback && !this.useTextureLookup
+          ? this.rendererBackend?.get?.(this.worldPatchStorage)?.buffer
+          : undefined;
+      const useZeroReadback = Boolean(threeDstBuf);
 
       // Single command encoder for the ENTIRE 9-layer Transformer!
       const enc = this.device.createCommandEncoder();
-      const pass = enc.beginComputePass();
-
-      const wgTok16 = Math.ceil(nTokens / 16);
       const wgTok64 = Math.ceil(nTokens / 64);
-      const dispatchLinear = (bindGroup: GPUBindGroup, dynOff: number, outDim: number) => {
-        pass.setPipeline(this.pipeLinear);
-        pass.setBindGroup(0, bindGroup, [dynOff]);
-        pass.dispatchWorkgroups(Math.ceil(outDim / 64), wgTok16, 1);
-      };
-
-      // 1. Centroid + Prep + Stem
-      pass.setPipeline(this.pipeCentroid);
-      pass.setBindGroup(0, bgs.centroid, [offCentroid]);
-      pass.dispatchWorkgroups(1, 1, 1);
-
-      pass.setPipeline(this.pipePrep);
-      pass.setBindGroup(0, bgs.prep, [offPrep]);
-      pass.dispatchWorkgroups(wgTok64, 1, 1);
-
-      dispatchLinear(bgs.stem1, offStem1, dModel);
-      dispatchLinear(bgs.stem2, offStem2, dModel);
-
-      // 2. N Transformer Layers
       const wgQKV = Math.ceil((nTokens * nHeads) / 64);
-      for (let l = 0; l < nLayers; l++) {
-        const s = layerSlots[l];
-        pass.setPipeline(this.pipeRMS);
-        pass.setBindGroup(0, bgs.rmsX, [s.rms1]);
+
+      if (this.isQ8Turbo && this.q8Layout) {
+        const QL = this.q8Layout;
+        const offCentroid = pushU32(nTokens, 0, 0, 0);
+        const offPrep = pushPrep(nTokens, posScale);
+        const offStem1 = pushU32(nTokens, 13, dModel, QL.stem1W, QL.stem1B, 1, 0, 0);
+        const offStem2 = pushU32(nTokens, dModel, dModel, QL.stem2W, QL.stem2S, QL.stem2B, 0, 0);
+
+        const qkvOutDim = nHeads * 78;
+        const layerSlots = QL.layers.map((L) => ({
+          rms1: pushU32(nTokens, dModel, L.norm1W, 0),
+          qkvGeo: pushU32(nTokens, dModel, qkvOutDim, L.qkvW, L.qkvS, L.qkvB, 0, 0),
+          qkvBuild: pushU32(nTokens, nHeads, 0, 0),
+          attn: pushU32(nTokens, nHeads, 0, 0),
+          wO: pushU32(nTokens, dModel, dModel, L.wOW, L.wOS, L.wOB, 0, 1),
+          rms2: pushU32(nTokens, dModel, L.norm2W, 0),
+          fc1: pushU32(nTokens, dModel, dFF, L.fc1W, L.fc1S, L.fc1B, 1, 0),
+          fc2: pushU32(nTokens, dFF, dModel, L.fc2W, L.fc2S, L.fc2B, 0, 1),
+        }));
+
+        const offFinalNorm = pushU32(nTokens, dModel, QL.finalNormW, 0);
+        const offHead1 = pushU32(nTokens, dModel, dModel, QL.head1W, QL.head1S, QL.head1B, 1, 0);
+        const offHead2 = pushU32(nTokens, dModel, 12, QL.head2W, QL.head2B, 0, 0, 0);
+        const offDecode = pushU32(nTokens, 0, 0, 0);
+        const offPack = useZeroReadback ? pushU32(Math.min(nTokens, MAX_RENDER_PATCHES), 0, 0, 0) : 0;
+
+        this.device.queue.writeBuffer(this.paramsRingBuf, 0, this.paramsCPU.buffer, 0, slot * this.PARAM_STRIDE_BYTES);
+
+        const pass = enc.beginComputePass();
+        const wgTok32 = Math.ceil(nTokens / 32);
+        const dispatchQ8 = (bindGroup: GPUBindGroup, dynOff: number, outDim: number) => {
+          pass.setPipeline(this.pipeLinearQ8);
+          pass.setBindGroup(0, bindGroup, [dynOff]);
+          pass.dispatchWorkgroups(Math.ceil(outDim / 64), wgTok32, 1);
+        };
+
+        pass.setPipeline(this.pipeCentroid);
+        pass.setBindGroup(0, bgs.centroid, [offCentroid]);
+        pass.dispatchWorkgroups(1, 1, 1);
+
+        pass.setPipeline(this.pipePrep);
+        pass.setBindGroup(0, bgs.prep, [offPrep]);
+        pass.dispatchWorkgroups(wgTok64, 1, 1);
+
+        pass.setPipeline(this.pipeLinearF32);
+        pass.setBindGroup(0, bgs.q8Stem1!, [offStem1]);
+        pass.dispatchWorkgroups(Math.ceil(dModel / 64), nTokens, 1);
+
+        dispatchQ8(bgs.q8Stem2!, offStem2, dModel);
+
+        for (let l = 0; l < nLayers; l++) {
+          const s = layerSlots[l];
+          pass.setPipeline(this.pipeRMSF32);
+          pass.setBindGroup(0, bgs.q8RmsX!, [s.rms1]);
+          pass.dispatchWorkgroups(nTokens, 1, 1);
+
+          // Single fused QKV+Geo projection (5 dispatches -> 1!)
+          dispatchQ8(bgs.q8QkvGeo!, s.qkvGeo, qkvOutDim);
+
+          // Single fused Q+K+V builder (2 dispatches -> 1!)
+          pass.setPipeline(this.pipeBuildQKVFused);
+          pass.setBindGroup(0, bgs.q8BuildQKV!, [s.qkvBuild]);
+          pass.dispatchWorkgroups(wgQKV, 1, 1);
+
+          pass.setPipeline(this.pipeAttn);
+          pass.setBindGroup(0, bgs.attn, [s.attn]);
+          pass.dispatchWorkgroups(nHeads, wgTok64, 1);
+
+          dispatchQ8(bgs.q8WO!, s.wO, dModel);
+
+          pass.setPipeline(this.pipeRMSF32);
+          pass.setBindGroup(0, bgs.q8RmsXB!, [s.rms2]);
+          pass.dispatchWorkgroups(nTokens, 1, 1);
+
+          dispatchQ8(bgs.q8Fc1!, s.fc1, dFF);
+          dispatchQ8(bgs.q8Fc2!, s.fc2, dModel);
+        }
+
+        pass.setPipeline(this.pipeRMSF32);
+        pass.setBindGroup(0, bgs.q8RmsX!, [offFinalNorm]);
         pass.dispatchWorkgroups(nTokens, 1, 1);
 
-        dispatchLinear(bgs.qSem, s.qSem, nHeads * 19);
-        dispatchLinear(bgs.kSem, s.kSem, nHeads * 19);
-        dispatchLinear(bgs.vInv, s.vInv, nHeads * 26);
-        dispatchLinear(bgs.geoQ, s.geoQ, nHeads * 7);
-        dispatchLinear(bgs.geoK, s.geoK, nHeads * 7);
+        dispatchQ8(bgs.q8Head1!, offHead1, dModel);
 
-        pass.setPipeline(this.pipeBuildQK);
-        pass.setBindGroup(0, bgs.buildQK, [s.qkv]);
-        pass.dispatchWorkgroups(wgQKV, 1, 1);
+        pass.setPipeline(this.pipeLinearF32);
+        pass.setBindGroup(0, bgs.q8Head2!, [offHead2]);
+        pass.dispatchWorkgroups(1, nTokens, 1);
 
-        pass.setPipeline(this.pipeBuildV);
-        pass.setBindGroup(0, bgs.buildV, [s.qkv]);
-        pass.dispatchWorkgroups(wgQKV, 1, 1);
+        pass.setPipeline(this.pipeDecode);
+        pass.setBindGroup(0, bgs.decode, [offDecode]);
+        pass.dispatchWorkgroups(wgTok64, 1, 1);
 
-        pass.setPipeline(this.pipeAttn);
-        pass.setBindGroup(0, bgs.attn, [s.attn]);
-        pass.dispatchWorkgroups(nHeads, wgTok64, 1);
+        if (useZeroReadback) {
+          pass.setPipeline(this.pipePackWorldSH);
+          pass.setBindGroup(0, bgs.packWorldSH, [offPack]);
+          pass.dispatchWorkgroups(Math.ceil(Math.min(nTokens, MAX_RENDER_PATCHES) / 64), 1, 1);
+        }
+        pass.end();
+      } else {
+        // Legacy RDGI v1 FP16 path (100% preserved)
+        const offCentroid = pushU32(nTokens, 0, 0, 0);
+        const offPrep = pushPrep(nTokens, posScale);
+        const offStem1 = pushU32(nTokens, 13, dModel, this.layout.stem1W, this.layout.stem1B, 1, 0, 0);
+        const offStem2 = pushU32(nTokens, dModel, dModel, this.layout.stem2W, this.layout.stem2B, 0, 0, 0);
 
-        // xBBuf = xABuf + W_o(attnMerged)
-        dispatchLinear(bgs.wO, s.wO, dModel);
+        const layerSlots = this.layout.layers.map((L) => ({
+          rms1: pushU32(nTokens, dModel, L.norm1W, 0),
+          qSem: pushU32(nTokens, dModel, nHeads * 19, L.qSemW, L.qSemB, 0, 0, 0),
+          kSem: pushU32(nTokens, dModel, nHeads * 19, L.kSemW, L.kSemB, 0, 0, 0),
+          vInv: pushU32(nTokens, dModel, nHeads * 26, L.vInvW, L.vInvB, 0, 0, 0),
+          geoQ: pushU32(nTokens, dModel, nHeads * 7, L.geoQW, L.geoQB, 0, 0, 0),
+          geoK: pushU32(nTokens, dModel, nHeads * 7, L.geoKW, L.geoKB, 0, 0, 0),
+          qkv: pushU32(nTokens, nHeads, 0, 0),
+          attn: pushU32(nTokens, nHeads, 0, 0),
+          wO: pushU32(nTokens, dModel, dModel, L.wOW, L.wOB, 0, 1, 0),
+          rms2: pushU32(nTokens, dModel, L.norm2W, 0),
+          fc1: pushU32(nTokens, dModel, dFF, L.fc1W, L.fc1B, 1, 0, 0),
+          fc2: pushU32(nTokens, dFF, dModel, L.fc2W, L.fc2B, 0, 1, 0),
+        }));
+
+        const offFinalNorm = pushU32(nTokens, dModel, this.layout.finalNormW, 0);
+        const offHead1 = pushU32(nTokens, dModel, dModel, this.layout.head1W, this.layout.head1B, 1, 0, 0);
+        const offHead2 = pushU32(nTokens, dModel, 12, this.layout.head2W, this.layout.head2B, 0, 0, 0);
+        const offDecode = pushU32(nTokens, 0, 0, 0);
+        const offPack = useZeroReadback ? pushU32(Math.min(nTokens, MAX_RENDER_PATCHES), 0, 0, 0) : 0;
+
+        this.device.queue.writeBuffer(this.paramsRingBuf, 0, this.paramsCPU.buffer, 0, slot * this.PARAM_STRIDE_BYTES);
+
+        const pass = enc.beginComputePass();
+        const wgTok16 = Math.ceil(nTokens / 16);
+        const dispatchLinear = (bindGroup: GPUBindGroup, dynOff: number, outDim: number) => {
+          pass.setPipeline(this.pipeLinear);
+          pass.setBindGroup(0, bindGroup, [dynOff]);
+          pass.dispatchWorkgroups(Math.ceil(outDim / 64), wgTok16, 1);
+        };
+
+        pass.setPipeline(this.pipeCentroid);
+        pass.setBindGroup(0, bgs.centroid, [offCentroid]);
+        pass.dispatchWorkgroups(1, 1, 1);
+
+        pass.setPipeline(this.pipePrep);
+        pass.setBindGroup(0, bgs.prep, [offPrep]);
+        pass.dispatchWorkgroups(wgTok64, 1, 1);
+
+        dispatchLinear(bgs.stem1, offStem1, dModel);
+        dispatchLinear(bgs.stem2, offStem2, dModel);
+
+        for (let l = 0; l < nLayers; l++) {
+          const s = layerSlots[l];
+          pass.setPipeline(this.pipeRMS);
+          pass.setBindGroup(0, bgs.rmsX, [s.rms1]);
+          pass.dispatchWorkgroups(nTokens, 1, 1);
+
+          dispatchLinear(bgs.qSem, s.qSem, nHeads * 19);
+          dispatchLinear(bgs.kSem, s.kSem, nHeads * 19);
+          dispatchLinear(bgs.vInv, s.vInv, nHeads * 26);
+          dispatchLinear(bgs.geoQ, s.geoQ, nHeads * 7);
+          dispatchLinear(bgs.geoK, s.geoK, nHeads * 7);
+
+          pass.setPipeline(this.pipeBuildQK);
+          pass.setBindGroup(0, bgs.buildQK, [s.qkv]);
+          pass.dispatchWorkgroups(wgQKV, 1, 1);
+
+          pass.setPipeline(this.pipeBuildV);
+          pass.setBindGroup(0, bgs.buildV, [s.qkv]);
+          pass.dispatchWorkgroups(wgQKV, 1, 1);
+
+          pass.setPipeline(this.pipeAttn);
+          pass.setBindGroup(0, bgs.attn, [s.attn]);
+          pass.dispatchWorkgroups(nHeads, wgTok64, 1);
+
+          dispatchLinear(bgs.wO, s.wO, dModel);
+
+          pass.setPipeline(this.pipeRMS);
+          pass.setBindGroup(0, bgs.rmsXB, [s.rms2]);
+          pass.dispatchWorkgroups(nTokens, 1, 1);
+
+          dispatchLinear(bgs.fc1, s.fc1, dFF);
+          dispatchLinear(bgs.fc2, s.fc2, dModel);
+        }
 
         pass.setPipeline(this.pipeRMS);
-        pass.setBindGroup(0, bgs.rmsXB, [s.rms2]);
+        pass.setBindGroup(0, bgs.rmsX, [offFinalNorm]);
         pass.dispatchWorkgroups(nTokens, 1, 1);
 
-        dispatchLinear(bgs.fc1, s.fc1, dFF);
-        // xABuf = xBBuf + fc2(ffnBuf)
-        dispatchLinear(bgs.fc2, s.fc2, dModel);
+        dispatchLinear(bgs.head1, offHead1, dModel);
+        dispatchLinear(bgs.head2, offHead2, 12);
+
+        pass.setPipeline(this.pipeDecode);
+        pass.setBindGroup(0, bgs.decode, [offDecode]);
+        pass.dispatchWorkgroups(wgTok64, 1, 1);
+
+        if (useZeroReadback) {
+          pass.setPipeline(this.pipePackWorldSH);
+          pass.setBindGroup(0, bgs.packWorldSH, [offPack]);
+          pass.dispatchWorkgroups(Math.ceil(Math.min(nTokens, MAX_RENDER_PATCHES) / 64), 1, 1);
+        }
+        pass.end();
       }
 
-      // 3. Final RMSNorm + Output Head + Physical SH Decode
-      pass.setPipeline(this.pipeRMS);
-      pass.setBindGroup(0, bgs.rmsX, [offFinalNorm]);
-      pass.dispatchWorkgroups(nTokens, 1, 1);
-
-      dispatchLinear(bgs.head1, offHead1, dModel);
-      dispatchLinear(bgs.head2, offHead2, 12);
-
-      pass.setPipeline(this.pipeDecode);
-      pass.setBindGroup(0, bgs.decode, [offDecode]);
-      pass.dispatchWorkgroups(wgTok64, 1, 1);
-      pass.end();
-
       const outBytes = nTokens * SH_STRIDE * 4;
-      enc.copyBufferToBuffer(this.shOutBuf, 0, this.readbackBuf, 0, outBytes);
+      if (useZeroReadback && threeDstBuf) {
+        const packBytes = Math.min(nTokens, MAX_RENDER_PATCHES) * WORLD_PATCH_VEC4S * 4 * 4;
+        enc.copyBufferToBuffer(this.worldPatchGpuBuf, 0, threeDstBuf, 0, packBytes);
+      } else {
+        enc.copyBufferToBuffer(this.shOutBuf, 0, this.readbackBuf, 0, outBytes);
+      }
+
       let gpuValidationErr: GPUError | null = null;
       if (this.useTextureLookup && typeof this.device.pushErrorScope === 'function') {
         this.device.pushErrorScope('validation');
@@ -1369,9 +1712,29 @@ export class RadiantComputeEngine {
         this.device = null;
         this.isCPUFallback = true;
         if (!this.cpuWeightsF32 && this.rawWeightsBuffer) {
-          this.cpuWeightsF32 = unpackRDGIWeightsF32(this.rawWeightsBuffer);
+          if (this.isQ8Turbo) {
+            const dv = new DataView(this.rawWeightsBuffer);
+            const unpacked = unpackRDG8ToCanonicalF32(
+              this.rawWeightsBuffer,
+              this.header,
+              dv.getUint32(24, true),
+              dv.getUint32(28, true),
+            );
+            this.cpuWeightsF32 = unpacked.weights;
+            this.layout = unpacked.layout;
+          } else {
+            this.cpuWeightsF32 = unpackRDGIWeightsF32(this.rawWeightsBuffer);
+          }
         }
-        return this._runInferTokens(tokens, updateWorldStorage);
+        return this._runInferTokens(tokens, updateWorldStorage, readback);
+      }
+
+      if (useZeroReadback) {
+        await this.device.queue.onSubmittedWorkDone();
+        this.lastComputeMs = performance.now() - t0;
+        this.activeTokenCount = nTokens;
+        this.lastWorldTokens = new Float32Array(tokens.subarray(0, nTokens * TOKEN_STRIDE));
+        return this.lastLocalSH;
       }
 
       await this.readbackBuf.mapAsync(GPUMapMode.READ, 0, outBytes);

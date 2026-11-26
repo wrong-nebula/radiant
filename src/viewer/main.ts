@@ -41,7 +41,7 @@ import {
 } from './rooms.ts';
 
 const BASE_URL: string = (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? './';
-const WEIGHTS_URL = `${BASE_URL}artifacts/radiant_gi_fp16.bin`;
+const WEIGHTS_URL = `${BASE_URL}artifacts/radiant_gi_q8.bin`;
 const PROBES_URL = `${BASE_URL}data/parity_probes.json`;
 
 class RadiantShowcaseApp {
@@ -161,27 +161,28 @@ class RadiantShowcaseApp {
     const toastEl = document.getElementById('toast');
     if (elSt) elSt.textContent = 'LOADING';
     if (toastEl) {
-      toastEl.textContent = 'Loading RADIANT FP16 weights (13.2 MB)...';
+      toastEl.textContent = 'Loading RADIANT INT8 weights (6.8 MB)...';
       toastEl.classList.remove('hidden');
     }
 
     await this.engine.loadWeightsFromUrl(WEIGHTS_URL, (loaded, total) => {
       const mbLoaded = (loaded / (1024 * 1024)).toFixed(1);
-      const mbTotal = total > 0 ? (total / (1024 * 1024)).toFixed(1) : '13.2';
+      const mbTotal = total > 0 ? (total / (1024 * 1024)).toFixed(1) : '6.8';
       if (toastEl) {
-        toastEl.textContent = `Loading RADIANT FP16 weights (${mbLoaded} / ${mbTotal} MB)...`;
+        toastEl.textContent = `Loading RADIANT INT8 weights (${mbLoaded} / ${mbTotal} MB)...`;
         toastEl.classList.remove('hidden');
       }
     });
 
     const badge = document.getElementById('gpu-badge');
     if (badge) {
+      const fmt = this.engine.isQ8Turbo ? (this.engine.hasF16 ? 'Q8·F16' : 'Q8') : 'FP16';
       if (this.engine.isCPUFallback) {
         badge.textContent = `WebGL2 · ${this.engine.header.nLayers}L CPU GI`;
       } else if (this.engine.useTextureLookup) {
-        badge.textContent = `WebGL2 + WebGPU · ${this.engine.header.nLayers}L`;
+        badge.textContent = `WebGL2 + WebGPU · ${fmt}`;
       } else {
-        badge.textContent = `WebGPU · ${this.engine.header.nLayers}L FP16`;
+        badge.textContent = `WebGPU · ${this.engine.header.nLayers}L ${fmt}`;
       }
     }
 
@@ -260,7 +261,7 @@ class RadiantShowcaseApp {
     this._showToast(`Loaded: ${built.title}`);
   }
 
-  public async recomputeGI(): Promise<{ computeMs: number; nTokens: number }> {
+  public async recomputeGI(forceReadback = true): Promise<{ computeMs: number; nTokens: number }> {
     const gen = this.roomGeneration;
     let tokensToRun: Float32Array;
     if (this.isBenchmarkRoom && this.benchmarkTokens) {
@@ -277,7 +278,25 @@ class RadiantShowcaseApp {
     }
 
     const nTokens = Math.floor(tokensToRun.length / TOKEN_STRIDE);
-    const predSH = await this.engine.inferTokens(tokensToRun, false);
+    const needsCPU =
+      forceReadback ||
+      this.showPatches ||
+      this.showSHProbes ||
+      this.isBenchmarkRoom ||
+      this.currentViewMode === 5 ||
+      this.engine.useTextureLookup;
+
+    if (!needsCPU) {
+      // Zero-readback GPU-to-GPU path: packs World SH directly into Three.js StorageBufferAttribute!
+      await this.engine.inferTokens(tokensToRun, true, false);
+      if (gen !== this.roomGeneration) {
+        return { computeMs: this.engine.lastComputeMs, nTokens };
+      }
+      this._updateMetricsHUD(this.engine.lastComputeMs, nTokens, 'COMPUTED');
+      return { computeMs: this.engine.lastComputeMs, nTokens };
+    }
+
+    const predSH = await this.engine.inferTokens(tokensToRun, false, true);
     if (gen !== this.roomGeneration) {
       return { computeMs: this.engine.lastComputeMs, nTokens };
     }
@@ -637,10 +656,10 @@ class RadiantShowcaseApp {
     const spec = this.roomObjects[3] ?? this.roomObjects[0];
     const startX = spec.mesh.position.x;
     const computeTimes: number[] = [];
-    // Measure 6 direct GPU compute latencies first
+    // Measure 6 direct GPU compute latencies using the real interactive zero-readback path!
     for (let k = 0; k < 6; k++) {
       spec.mesh.position.x = startX + (k % 2 === 0 ? 0.25 : 0.0);
-      await this.recomputeGI();
+      await this.recomputeGI(false);
       computeTimes.push(this.engine.lastComputeMs);
     }
     // Measure real interactive rAF drag loop FPS while continuously perturbing the wall
@@ -836,11 +855,11 @@ class RadiantShowcaseApp {
       this.fpsAccumTime = 0;
     }
 
-    // Non-blocking dirty-flag WebGPU GI recompute (0 ms when static!)
+    // Non-blocking dirty-flag WebGPU GI recompute (0 ms when static, zero-readback on drag!)
     if (this.giDirty && !this.computeInFlight) {
       this.giDirty = false;
       this.computeInFlight = true;
-      this.recomputeGI().finally(() => {
+      this.recomputeGI(false).finally(() => {
         this.computeInFlight = false;
       });
     }
