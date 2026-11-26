@@ -1,0 +1,105 @@
+{
+  "gate": "O3_HELDOUT_MULTIBOUNCE_GI_FIDELITY",
+  "passed": true,
+  "n_heldout_scenes": 256,
+  "aligned_metrics": {
+    "psnr_db": 30.7122,
+    "color_bleed_r": 0.9954,
+    "sh_dir_cosine": 0.98643,
+    "sh_rmse": 0.104883
+  },
+  "rotated_metrics": {
+    "psnr_db": 30.7109,
+    "color_bleed_r": 0.9954,
+    "sh_dir_cosine": 0.98643,
+    "sh_rmse": 0.104889
+  },
+  "se3_invariance_drift": {
+    "mean_se3_rmse": 0.00021,
+    "max_se3_rmse": 0.0002404,
+    "max_abs_diff": 0.02005
+  },
+  "dynamic_occlusion": {
+    "n_pairs": 16,
+    "mean_gt_drop_ratio": 0.955,
+    "mean_pred_drop_ratio": 0.9631,
+    "mean_drop_abs_error": 0.0109,
+    "passed_drop_ge_40pct": true,
+    "sample_pairs": [
+      {
+        "pair": 0,
+        "gt_open": 0.2591,
+        "gt_occ": 0.0138,
+        "gt_drop_pct": 94.69,
+        "pred_open": 0.2574,
+        "pred_occ": 0.0104,
+        "pred_drop_pct": 95.96
+      },
+      {
+        "pair": 1,
+        "gt_open": 0.1965,
+        "gt_occ": 0.0095,
+        "gt_drop_pct": 95.17,
+        "pred_open": 0.1875,
+        "pred_occ": 0.005,
+        "pred_drop_pct": 97.32
+      },
+      {
+        "pair": 2,
+        "gt_open": 0.1053,
+        "gt_occ": 0.0052,
+        "gt_drop_pct": 95.11,
+        "pred_open": 0.1169,
+        "pred_occ": 0.0029,
+        "pred_drop_pct": 97.48
+      },
+      {
+        "pair": 3,
+        "gt_open": 0.2461,
+        "gt_occ": 0.0132,
+        "gt_drop_pct": 94.62,
+        "pred_open": 0.2433,
+        "pred_occ": 0.0157,
+        "pred_drop_pct": 93.56
+      }
+    ]
+  },
+  "per_topology_breakdown": {
+    "unseen_cornell_sculptural": {
+      "n_scenes": 67,
+      "psnr_db": 31.272,
+      "color_bleed_r": 0.9957,
+      "sh_dir_cosine": 0.9895
+    },
+    "unseen_diagonal_gallery": {
+      "n_scenes": 74,
+      "psnr_db": 29.93,
+      "color_bleed_r": 0.9931,
+      "sh_dir_cosine": 0.9814
+    },
+    "unseen_split_doorway": {
+      "n_scenes": 48,
+      "psnr_db": 29.832,
+      "color_bleed_r": 0.9932,
+      "sh_dir_cosine": 0.9812
+    },
+    "unseen_vaulted_atrium": {
+      "n_scenes": 67,
+      "psnr_db": 32.109,
+      "color_bleed_r": 0.9973,
+      "sh_dir_cosine": 0.9923
+    }
+  },
+  "export_info": {
+    "path": "/content/radiant_out/radiant_gi_fp16.bin",
+    "size_bytes": 13817400,
+    "size_mb": 13.177,
+    "n_tensors": 171,
+    "total_params": 6908668
+  },
+  "probe_info": {
+    "path": "/content/radiant_out/parity_probes.json",
+    "n_probes": 4,
+    "size_mb": 1.266
+  }
+}

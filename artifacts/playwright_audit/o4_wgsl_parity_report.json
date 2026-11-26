@@ -1,0 +1,44 @@
+{
+  "gate": "O4_PYTORCH_TO_WEBGPU_WGSL_PARITY",
+  "passed": true,
+  "worst_rmse": 1e-06,
+  "mean_compute_ms": 73.25,
+  "probes": [
+    {
+      "scene_index": 0,
+      "n_tokens": 384,
+      "wgsl_vs_pytorch_rmse": 0,
+      "wgsl_vs_pytorch_max_abs": 7e-06,
+      "wgsl_psnr_vs_gt_db": 33.765,
+      "pytorch_psnr_vs_gt_db": 33.764,
+      "compute_ms": 62.3
+    },
+    {
+      "scene_index": 1,
+      "n_tokens": 480,
+      "wgsl_vs_pytorch_rmse": 0,
+      "wgsl_vs_pytorch_max_abs": 7e-06,
+      "wgsl_psnr_vs_gt_db": 30.566,
+      "pytorch_psnr_vs_gt_db": 30.566,
+      "compute_ms": 72.1
+    },
+    {
+      "scene_index": 2,
+      "n_tokens": 576,
+      "wgsl_vs_pytorch_rmse": 0,
+      "wgsl_vs_pytorch_max_abs": 7e-06,
+      "wgsl_psnr_vs_gt_db": 34.598,
+      "pytorch_psnr_vs_gt_db": 34.598,
+      "compute_ms": 78.3
+    },
+    {
+      "scene_index": 3,
+      "n_tokens": 544,
+      "wgsl_vs_pytorch_rmse": 1e-06,
+      "wgsl_vs_pytorch_max_abs": 1.1e-05,
+      "wgsl_psnr_vs_gt_db": 29.057,
+      "pytorch_psnr_vs_gt_db": 29.057,
+      "compute_ms": 80.3
+    }
+  ]
+}

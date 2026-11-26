@@ -1,0 +1,302 @@
+{
+  "gate": "O5_PLAYWRIGHT_M1_METAL3_AUDIT",
+  "passed": true,
+  "adapter": {
+    "webgpu": true,
+    "info": {
+      "vendor": "apple",
+      "arch": "metal-3",
+      "device": ""
+    }
+  },
+  "console_errors": [],
+  "page_errors": [],
+  "external_requests": [],
+  "all_renders_non_blank": true,
+  "pixel_diffs_viewport": {
+    "cornell_gi_vs_direct_l1": 38.212,
+    "cornell_live_bleed_shift_l1": 45.233,
+    "lcorridor_open_vs_occluded_l1": 14.924
+  },
+  "gpu_indirect_rgb_checks": {
+    "knot_before_rgb": [
+      0.2015,
+      0.2087,
+      0.0986
+    ],
+    "knot_after_shift_rgb": [
+      0.2057,
+      0.1507,
+      0.1599
+    ],
+    "knot_chroma_shift_l2": 0.1655,
+    "east_sculpt_open_rgb": [
+      0.0723,
+      0.0419,
+      0.0231
+    ],
+    "east_sculpt_occluded_rgb": [
+      0.0254,
+      0.0132,
+      0.0065
+    ],
+    "corridor_occlusion_drop_ratio": 0.6713
+  },
+  "performance_m1": {
+    "steady_fps": 60.7,
+    "live_drag_fps": 62.2,
+    "mean_gi_compute_ms": 51.13,
+    "n_tokens": 352
+  },
+  "screenshots": {
+    "01_cornell_radiant_gi": "artifacts/playwright_audit/01_cornell_radiant_gi.png",
+    "02_cornell_direct_only": "artifacts/playwright_audit/02_cornell_direct_only.png",
+    "03_cornell_split_screen": "artifacts/playwright_audit/03_cornell_split_screen.png",
+    "04_cornell_indirect_only": "artifacts/playwright_audit/04_cornell_indirect_only.png",
+    "05_cornell_xray_probes": "artifacts/playwright_audit/05_cornell_xray_probes.png",
+    "06_cornell_color_bleed_shift": "artifacts/playwright_audit/06_cornell_color_bleed_shift.png",
+    "07_vaulted_gallery": "artifacts/playwright_audit/07_vaulted_gallery.png",
+    "08_lcorridor_open": "artifacts/playwright_audit/08_lcorridor_open.png",
+    "09_lcorridor_occluded": "artifacts/playwright_audit/09_lcorridor_occluded.png",
+    "10_studio_showcase": "artifacts/playwright_audit/10_studio_showcase.png",
+    "11_benchmark_live": "artifacts/playwright_audit/11_benchmark_live.png",
+    "12_benchmark_gt1024": "artifacts/playwright_audit/12_benchmark_gt1024.png",
+    "13_benchmark_error_heatmap": "artifacts/playwright_audit/13_benchmark_error_heatmap.png"
+  },
+  "screenshot_stats": {
+    "01_cornell_radiant_gi": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        133.0,
+        143.68,
+        101.84
+      ],
+      "std_rgb": [
+        72.81,
+        77.39,
+        70.79
+      ],
+      "non_blank": true
+    },
+    "02_cornell_direct_only": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        96.39,
+        112.3,
+        78.8
+      ],
+      "std_rgb": [
+        73.49,
+        74.72,
+        66.88
+      ],
+      "non_blank": true
+    },
+    "03_cornell_split_screen": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        116.51,
+        132.53,
+        92.38
+      ],
+      "std_rgb": [
+        69.19,
+        77.04,
+        66.47
+      ],
+      "non_blank": true
+    },
+    "04_cornell_indirect_only": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        148.18,
+        140.24,
+        113.79
+      ],
+      "std_rgb": [
+        57.71,
+        55.67,
+        50.08
+      ],
+      "non_blank": true
+    },
+    "05_cornell_xray_probes": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        134.27,
+        145.5,
+        103.84
+      ],
+      "std_rgb": [
+        72.67,
+        76.26,
+        70.91
+      ],
+      "non_blank": true
+    },
+    "06_cornell_color_bleed_shift": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        114.33,
+        101.92,
+        131.44
+      ],
+      "std_rgb": [
+        91.48,
+        77.74,
+        75.14
+      ],
+      "non_blank": true
+    },
+    "07_vaulted_gallery": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        129.22,
+        130.55,
+        134.6
+      ],
+      "std_rgb": [
+        61.26,
+        61.84,
+        61.14
+      ],
+      "non_blank": true
+    },
+    "08_lcorridor_open": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        94.26,
+        78.71,
+        63.37
+      ],
+      "std_rgb": [
+        73.25,
+        67.61,
+        62.48
+      ],
+      "non_blank": true
+    },
+    "09_lcorridor_occluded": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        82.48,
+        67.74,
+        54.14
+      ],
+      "std_rgb": [
+        74.28,
+        68.48,
+        63.25
+      ],
+      "non_blank": true
+    },
+    "10_studio_showcase": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        113.46,
+        109.42,
+        111.22
+      ],
+      "std_rgb": [
+        83.06,
+        81.05,
+        77.68
+      ],
+      "non_blank": true
+    },
+    "11_benchmark_live": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        163.97,
+        139.71,
+        105.64
+      ],
+      "std_rgb": [
+        67.27,
+        67.42,
+        63.41
+      ],
+      "non_blank": true
+    },
+    "12_benchmark_gt1024": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        162.56,
+        138.25,
+        104.82
+      ],
+      "std_rgb": [
+        68.04,
+        68.75,
+        64.09
+      ],
+      "non_blank": true
+    },
+    "13_benchmark_error_heatmap": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        91.81,
+        145.72,
+        167.48
+      ],
+      "std_rgb": [
+        36.29,
+        51.19,
+        53.68
+      ],
+      "non_blank": true
+    }
+  }
+}

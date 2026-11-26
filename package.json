@@ -1,0 +1,22 @@
+{
+  "name": "three-radiant-gi",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-shot, zero-bake real-time multi-bounce Global Illumination engine for Three.js 0.187.0 WebGPU + TSL",
+  "scripts": {
+    "dev": "vite --port 4173",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 4173",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.187.0",
+    "@webgpu/types": "^0.1.74",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0"
+  }
+}

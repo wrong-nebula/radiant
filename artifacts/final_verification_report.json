@@ -1,0 +1,45 @@
+{
+  "overall_passed": true,
+  "oracles": {
+    "O1_warp_physics": {
+      "passed": true,
+      "white_furnace_rel_err": 2.7e-05,
+      "cornell_radiosity_rel_err": 0.011974
+    },
+    "O2_se3_invariance_and_slice0": {
+      "passed": true,
+      "h1_rotated_psnr_db": 7.4538,
+      "h2_rotated_psnr_db": 21.2884,
+      "local_fp16_se3_max_rmse": 2.6e-06
+    },
+    "O3_heldout_256_unseen_gi": {
+      "passed": true,
+      "n_scenes": 256,
+      "aligned_psnr_db": 30.7124,
+      "rotated_psnr_db": 30.7124,
+      "color_bleed_r": 0.9954,
+      "sh_dir_cosine": 0.98643,
+      "occlusion_gt_drop": 0.955,
+      "occlusion_pred_drop": 0.9631
+    },
+    "O4_pytorch_to_wgsl_parity": {
+      "passed": true,
+      "worst_rmse": 1e-06,
+      "mean_compute_ms": 73.25
+    },
+    "O5_playwright_m1_and_hygiene": {
+      "passed": true,
+      "playwright_passed": true,
+      "console_errors": 0,
+      "steady_fps": 60.7,
+      "live_drag_fps": 62.2,
+      "local_data_plus_artifacts_mb": 21.757,
+      "model_bin_mb": 13.177,
+      "colab_cumulative_units": 21.6113,
+      "colab_sessions_logged": 14,
+      "leaked_managed_colab_vms": [],
+      "oracle_sha256_intact": true,
+      "oracle_sha256_errors": []
+    }
+  }
+}

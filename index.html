@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>THREE-RADIANT-GI — Zero-Bake Real-Time WebGPU Multi-Bounce GI</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="viewport"></canvas>
+
+      <!-- Split-Screen Wipe Handle (visible only in Split-Screen mode) -->
+      <div id="split-divider" class="hidden">
+        <div class="split-tag left">Direct Light Only</div>
+        <div class="split-handle">↔</div>
+        <div class="split-tag right">Live RADIANT-GI</div>
+      </div>
+
+      <!-- Compact Glassmorphic HUD -->
+      <aside id="hud">
+        <header class="hud-header">
+          <div>
+            <h1>THREE-RADIANT-GI</h1>
+            <p class="subtitle">Zero-Bake 3-Bounce WebGPU SE(3) GI</p>
+          </div>
+          <span id="gpu-badge" class="badge">WebGPU</span>
+        </header>
+
+        <section class="metrics-grid">
+          <div class="metric">
+            <span class="label">FPS</span>
+            <span id="m-fps" class="value">--</span>
+          </div>
+          <div class="metric">
+            <span class="label">GI Compute</span>
+            <span id="m-gi-ms" class="value">0.0 ms</span>
+          </div>
+          <div class="metric">
+            <span class="label">Tokens</span>
+            <span id="m-tokens" class="value">--</span>
+          </div>
+          <div class="metric">
+            <span class="label">Status</span>
+            <span id="m-state" class="value ok">IDLE</span>
+          </div>
+        </section>
+
+        <section class="panel-group">
+          <label class="group-title">Unseen Playable Rooms</label>
+          <div class="btn-grid" id="room-buttons">
+            <button data-room="0" class="active">1. Cornell Color-Bleed</button>
+            <button data-room="1">2. Vaulted Gallery</button>
+            <button data-room="2">3. L-Corridor Occlusion</button>
+            <button data-room="3">4. Studio Showcase</button>
+            <button data-room="4" class="span-2">5. Held-Out 1024-spp Benchmark</button>
+          </div>
+        </section>
+
+        <section class="panel-group">
+          <label class="group-title">Render Lens &amp; Comparison</label>
+          <div class="btn-grid" id="mode-buttons">
+            <button data-mode="0" class="active">Live RADIANT-GI</button>
+            <button data-mode="1">Direct Only</button>
+            <button data-mode="4">Split-Screen Wipe</button>
+            <button data-mode="2">Indirect Bounce Only</button>
+            <button data-mode="5" id="btn-ref-gt">1024-spp Reference</button>
+            <button data-mode="3" id="btn-heatmap">Error Heatmap</button>
+          </div>
+          <div id="split-slider-row" class="slider-row hidden">
+            <span>Wipe Position</span>
+            <input id="split-slider" type="range" min="0.05" max="0.95" step="0.01" value="0.5" />
+          </div>
+          <div class="slider-row">
+            <span>GI Bounce Gain</span>
+            <input id="gi-gain-slider" type="range" min="0.0" max="2.5" step="0.05" value="1.15" />
+            <span id="gi-gain-val">1.15×</span>
+          </div>
+        </section>
+
+        <section class="panel-group">
+          <label class="group-title">Scientific X-Ray Overlays</label>
+          <div class="toggle-row">
+            <label><input type="checkbox" id="chk-patches" /> 32-Patch Token Spheres</label>
+            <label><input type="checkbox" id="chk-sh-probes" /> SH Directional Probes</label>
+          </div>
+        </section>
+
+        <section class="panel-group">
+          <label class="group-title">Interactive Object Manipulation</label>
+          <p class="hint">Click any wall, partition, sculpture, or lamp to drag live (G=Move, R=Rotate, Esc=Deselect).</p>
+          <div class="selected-bar">
+            <span id="selected-name">Selected: None</span>
+            <div class="btn-row">
+              <button id="btn-gizmo-t" class="mini active">Move</button>
+              <button id="btn-gizmo-r" class="mini">Rotate</button>
+              <button id="btn-deselect" class="mini">Clear</button>
+            </div>
+          </div>
+          <div class="swatch-row" id="color-swatches" title="Paint selected object to watch instant color bleed">
+            <span class="swatch-label">Bounce Tint:</span>
+            <button class="swatch" data-color="#d61c17" style="background:#d61c17" title="Cornell Crimson"></button>
+            <button class="swatch" data-color="#1cc729" style="background:#1cc729" title="Cornell Emerald"></button>
+            <button class="swatch" data-color="#1a47db" style="background:#1a47db" title="Cobalt Blue"></button>
+            <button class="swatch" data-color="#e08f14" style="background:#e08f14" title="Warm Amber"></button>
+            <button class="swatch" data-color="#14b8c2" style="background:#14b8c2" title="Studio Teal"></button>
+            <button class="swatch" data-color="#cfcbc4" style="background:#cfcbc4" title="Gallery White"></button>
+          </div>
+        </section>
+
+        <section class="panel-group">
+          <label class="group-title">Drop-In Any .GLB Mesh</label>
+          <div id="drop-zone" class="drop-zone">
+            Drag &amp; drop a <strong>.glb</strong> file here (or click to browse) for instant 32-patch zero-bake GI
+            <input id="glb-file-input" type="file" accept=".glb,.gltf" hidden />
+          </div>
+        </section>
+      </aside>
+
+      <div id="toast" class="toast hidden"></div>
+    </div>
+    <script type="module" src="/src/viewer/main.ts"></script>
+  </body>
+</html>
