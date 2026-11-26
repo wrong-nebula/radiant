@@ -24,16 +24,16 @@
     },
     "O4_pytorch_to_wgsl_parity": {
       "passed": true,
-      "worst_rmse": 0.001142,
-      "mean_compute_ms": 126.03
+      "worst_rmse": 0.001104,
+      "mean_compute_ms": 70.57
     },
     "O5_playwright_m1_and_hygiene": {
       "passed": true,
       "playwright_passed": true,
       "console_errors": 0,
-      "steady_fps": 60.6,
-      "live_drag_fps": 61.6,
-      "local_data_plus_artifacts_mb": 28.514,
+      "steady_fps": 60.3,
+      "live_drag_fps": 63,
+      "local_data_plus_artifacts_mb": 28.525,
       "model_bin_mb": 13.177,
       "colab_cumulative_units": 21.6113,
       "colab_sessions_logged": 14,

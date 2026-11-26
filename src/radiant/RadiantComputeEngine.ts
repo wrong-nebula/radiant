@@ -21,6 +21,7 @@ import {
   WGSL_LINEAR_F32,
   WGSL_PACK_WORLD_SH,
   WGSL_RMS_NORM_F32,
+  buildAttentionTurboWGSL,
   buildLinearQ8WGSL,
 } from './wgslTurboQ8.ts';
 
@@ -764,6 +765,9 @@ export class RadiantComputeEngine {
   private weightsBuf: GPUBuffer | null = null;
   private f32AuxBuf: GPUBuffer | null = null;
   private cpuWeightsF32: Float32Array | null = null;
+  private cpuWorker: Worker | null = null;
+  private cpuWorkerReady: Promise<void> | null = null;
+  private cpuWorkerSeq = 0;
   private rawWeightsBuffer: ArrayBuffer | null = null;
 
   // Compute pipelines (RDGI FP16 + RDG8 Turbo INT8 + On-GPU World SH Packer)
@@ -922,8 +926,65 @@ export class RadiantComputeEngine {
     return engine;
   }
 
+  private _initCpuWorker(buffer: ArrayBuffer, isQ8: boolean, q8U32Len = 0, f32Len = 0): void {
+    if (typeof Worker === 'undefined') return;
+    try {
+      if (this.cpuWorker) {
+        this.cpuWorker.terminate();
+        this.cpuWorker = null;
+      }
+      const w = new Worker(new URL('./cpuWorker.ts', import.meta.url), { type: 'module' });
+      const id = ++this.cpuWorkerSeq;
+      this.cpuWorker = w;
+      const copyBuf = buffer.slice(0);
+      this.cpuWorkerReady = new Promise<void>((resolve, reject) => {
+        const onMsg = (ev: MessageEvent) => {
+          if (ev.data?.id !== id) return;
+          w.removeEventListener('message', onMsg);
+          if (ev.data?.type === 'init_done') resolve();
+          else reject(new Error(ev.data?.error || 'CPU worker init failed'));
+        };
+        w.addEventListener('message', onMsg);
+        w.postMessage(
+          { type: 'init', id, buffer: copyBuf, header: this.header, isQ8, q8U32Len, f32Len, layout: isQ8 ? null : this.layout },
+          [copyBuf],
+        );
+      }).catch(() => {
+        this.cpuWorker = null;
+        this.cpuWorkerReady = null;
+      });
+    } catch {
+      this.cpuWorker = null;
+      this.cpuWorkerReady = null;
+    }
+  }
+
+  private _runCpuWorker(tokens: Float32Array, nTokens: number): Promise<{ result: Float32Array; computeMs: number } | null> {
+    if (!this.cpuWorker || !this.cpuWorkerReady) return Promise.resolve(null);
+    const w = this.cpuWorker;
+    const ready = this.cpuWorkerReady;
+    return ready.then(() => {
+      if (this.cpuWorker !== w) return null;
+      return new Promise<{ result: Float32Array; computeMs: number } | null>((resolve) => {
+        const id = ++this.cpuWorkerSeq;
+        const onMsg = (ev: MessageEvent) => {
+          if (ev.data?.id !== id) return;
+          w.removeEventListener('message', onMsg);
+          if (ev.data?.type === 'infer_done') {
+            resolve({ result: new Float32Array(ev.data.result), computeMs: ev.data.computeMs });
+          } else {
+            resolve(null);
+          }
+        };
+        w.addEventListener('message', onMsg);
+        const tokCopy = new Float32Array(tokens.subarray(0, nTokens * TOKEN_STRIDE));
+        w.postMessage({ type: 'infer', id, tokens: tokCopy.buffer, nTokens }, [tokCopy.buffer]);
+      });
+    });
+  }
+
   public get isWeightsLoaded(): boolean {
-    return this.isCPUFallback ? this.cpuWeightsF32 !== null : this.weightsBuf !== null;
+    return this.isCPUFallback ? (this.cpuWeightsF32 !== null || this.cpuWorker !== null) : this.weightsBuf !== null;
   }
 
   public static async createStandalone(weightsUrlOrBuffer: string | ArrayBuffer): Promise<RadiantComputeEngine> {
@@ -1012,7 +1073,7 @@ export class RadiantComputeEngine {
       { binding: 2, type: 'read-only-storage' },
       { binding: 3, type: 'storage' },
     ]);
-    this.pipeAttn = mkDynamicPipe(WGSL_SE3_ATTENTION, [
+    this.pipeAttn = mkDynamicPipe(buildAttentionTurboWGSL(this.hasF16), [
       { binding: 1, type: 'read-only-storage' },
       { binding: 2, type: 'read-only-storage' },
       { binding: 3, type: 'read-only-storage' },
@@ -1185,6 +1246,7 @@ export class RadiantComputeEngine {
     this.rawWeightsBuffer = buffer;
     if (this.isCPUFallback || !this.device) {
       this.cpuWeightsF32 = unpackRDGIWeightsF32(buffer);
+      this._initCpuWorker(buffer, false);
       return;
     }
 
@@ -1281,6 +1343,7 @@ export class RadiantComputeEngine {
       const unpacked = unpackRDG8ToCanonicalF32(buffer, this.header, q8U32Len, f32Len);
       this.cpuWeightsF32 = unpacked.weights;
       this.layout = unpacked.layout;
+      this._initCpuWorker(buffer, true, q8U32Len, f32Len);
       return;
     }
 
@@ -1438,10 +1501,13 @@ export class RadiantComputeEngine {
       const nTokens = Math.floor(tokens.length / TOKEN_STRIDE);
       if (nTokens <= 0) return new Float32Array(0);
       if (this.isCPUFallback || !this.device) {
-        if (!this.cpuWeightsF32) return new Float32Array(nTokens * SH_STRIDE);
+        if (!this.cpuWeightsF32 && !this.cpuWorker) return new Float32Array(nTokens * SH_STRIDE);
         const t0 = performance.now();
-        const result = await runRadiantCPU(tokens, nTokens, this.header, this.cpuWeightsF32, this.layout);
-        this.lastComputeMs = performance.now() - t0;
+        const workerOut = await this._runCpuWorker(tokens, nTokens);
+        const result = workerOut
+          ? workerOut.result
+          : await runRadiantCPU(tokens, nTokens, this.header, this.cpuWeightsF32!, this.layout);
+        this.lastComputeMs = workerOut ? workerOut.computeMs : performance.now() - t0;
         this.activeTokenCount = nTokens;
         this.lastLocalSH = result;
         this.lastWorldTokens = new Float32Array(tokens.subarray(0, nTokens * TOKEN_STRIDE));
@@ -1489,6 +1555,7 @@ export class RadiantComputeEngine {
 
       // Single command encoder for the ENTIRE 9-layer Transformer!
       const enc = this.device.createCommandEncoder();
+      const wgTok32 = Math.ceil(nTokens / 32);
       const wgTok64 = Math.ceil(nTokens / 64);
       const wgQKV = Math.ceil((nTokens * nHeads) / 64);
 
@@ -1520,11 +1587,10 @@ export class RadiantComputeEngine {
         this.device.queue.writeBuffer(this.paramsRingBuf, 0, this.paramsCPU.buffer, 0, slot * this.PARAM_STRIDE_BYTES);
 
         const pass = enc.beginComputePass();
-        const wgTok32 = Math.ceil(nTokens / 32);
         const dispatchQ8 = (bindGroup: GPUBindGroup, dynOff: number, outDim: number) => {
           pass.setPipeline(this.pipeLinearQ8);
           pass.setBindGroup(0, bindGroup, [dynOff]);
-          pass.dispatchWorkgroups(Math.ceil(outDim / 64), wgTok32, 1);
+          pass.dispatchWorkgroups(Math.ceil(outDim / 32), wgTok32, 1);
         };
 
         pass.setPipeline(this.pipeCentroid);
@@ -1557,7 +1623,7 @@ export class RadiantComputeEngine {
 
           pass.setPipeline(this.pipeAttn);
           pass.setBindGroup(0, bgs.attn, [s.attn]);
-          pass.dispatchWorkgroups(nHeads, wgTok64, 1);
+          pass.dispatchWorkgroups(nHeads, wgTok32, 1);
 
           dispatchQ8(bgs.q8WO!, s.wO, dModel);
 
@@ -1660,7 +1726,7 @@ export class RadiantComputeEngine {
 
           pass.setPipeline(this.pipeAttn);
           pass.setBindGroup(0, bgs.attn, [s.attn]);
-          pass.dispatchWorkgroups(nHeads, wgTok64, 1);
+          pass.dispatchWorkgroups(nHeads, wgTok32, 1);
 
           dispatchLinear(bgs.wO, s.wO, dModel);
 

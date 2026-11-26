@@ -132,15 +132,15 @@ Per-topology breakdown across the `256` strictly unseen held-out test rooms & un
 
 | Verification Check | Measured (Apple M1 Metal 3) | Target Gate | Status |
 | :--- | :---: | :---: | :---: |
-| PyTorch FP16 ↔ WGSL `RDG8` INT8+F16 Parity (4 Probes, 384–576 tok) | **`worst_rmse = 0.00114`** (`RDGI` FP16: `1.0e-6`) | `<= 0.005` | **PASS** |
+| PyTorch FP16 ↔ WGSL `RDG8` INT8+F16 Parity (4 Probes, 384–576 tok) | **`worst_rmse = 0.00110`** (`RDGI` FP16: `1.0e-6`) | `<= 0.005` | **PASS** |
 | Held-Out 256-Room O3 PSNR (`RDG8` INT8 `6.76 MB` vs `RDGI` FP16) | **`30.710 dB`** (`-0.002 dB`, `r = 0.9954`) | `>= 28.0 dB` | **PASS** |
-| Turbo `RDG8` 2D-Tiled `Q8·F16` + Zero-Readback Compute (352 tok, M1) | **`14.8 ms`** pure min / **`17.2–23.7 ms`** live w/ 60 fps 3D (v1: `181.6 ms`, **~8–12× faster**) | Real-time | **PASS** |
+| Turbo `RDG8` `32×32` `Q8·F16` + Zero-Readback Compute (352 tok, M1) | **`9.7 ms`** pure min / **`15.2–17.6 ms`** live w/ 60 fps 3D (v1: `181.6 ms`, **~10–18.7× faster**) | Real-time | **PASS** |
 | Console / Page / WGSL Validation Errors | **`0`** | `0` | **PASS** |
 | External Runtime CDN Requests | **`0`** | `0` | **PASS** |
-| Steady-State Interactive Frame Rate (0 ms GI when static) | **`60.6 fps`** | `>= 60 fps` | **PASS** |
-| Live-Drag Interactive Frame Rate | **`61.6 fps`** | `>= 30 fps` | **PASS** |
-| Cornell GI vs. Direct Pixel L1 / Live Wall Color-Bleed Shift L1 | `38.45` / `44.98` (`chroma L2 = 0.1663`) | Distinct shift | **PASS** |
-| L-Corridor Doorway Occlusion Live Indirect Drop | **`66.88%`** | Distinct drop | **PASS** |
+| Steady-State Interactive Frame Rate (0 ms GI when static) | **`60.3 fps`** | `>= 60 fps` | **PASS** |
+| Live-Drag Interactive Frame Rate | **`63.0 fps`** | `>= 30 fps` | **PASS** |
+| Cornell GI vs. Direct Pixel L1 / Live Wall Color-Bleed Shift L1 | `38.77` / `45.22` (`chroma L2 = 0.1664`) | Distinct shift | **PASS** |
+| L-Corridor Doorway Occlusion Live Indirect Drop | **`66.83%`** | Distinct drop | **PASS** |
 | Exported Runtime Binaries (`radiant_gi_q8.bin` / `radiant_gi_fp16.bin`) | **`6.76 MB`** INT8 / **`13.18 MB`** FP16 | `< 20 MB` | **PASS** |
 | Local `data/` + `artifacts/` Disk Total | **`28.5 MB`** (incl. both bins + 13 audit PNGs) | `<= 120 MB` | **PASS** |
 | Colab Compute Units Logged (`colab/budget_ledger.jsonl`) | **`21.61 u`** (`0` active leaked VMs) | `<= 25.0 u` | **PASS** |

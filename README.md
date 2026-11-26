@@ -9,10 +9,11 @@ Based on **RADIANT** (*Object-Centric Feed-Forward Global Illumination*, `arXiv:
 ![Cornell Color-Bleed Box](artifacts/playwright_audit/01_cornell_radiant_gi.png)
 ![Vaulted Brutalist Gallery](artifacts/playwright_audit/07_vaulted_gallery.png)
 
-## Highlights (v2.5 Turbo)
+## Highlights (v2.6 Sub-10ms Turbo)
 
 - **Zero-Bake 3-Bounce Indirect GI:** Drag any wall, partition, sculpture, or area lamp live — or drop in any textured `.glb` — for instant 32-patch surface tokenization, 3-bounce color bleed, dynamic doorway occlusion, and Order-1 SH directional diffuse + glossy specular indirect bounce light.
-- **Native Pure-WebGPU Turbo Compute Transformer:** 9-layer `d_model=256`, 8-head $SE(3)$-Invariant Form-Factor Transformer (`6.91M` params, `6.76 MB` fused-QKV INT8 `RDG8`) running in coalesced 2D register-blocked `shader-f16` + `unpack4x8snorm` WGSL shaders with zero-readback GPU-to-GPU World SH packing (**`14.8 ms`** pure compute min / **`17.2–23.7 ms`** live alongside 60 fps 3D rendering on Apple M1 Metal 3 — **~8–12× faster than v1**, `60.6` steady / `61.6` live-drag fps, `0.00114` RMSE vs. PyTorch FP16).
+- **Native Pure-WebGPU Sub-10ms Compute Transformer:** 9-layer `d_model=256`, 8-head $SE(3)$-Invariant Form-Factor Transformer (`6.91M` params, `6.76 MB` fused-QKV INT8 `RDG8`) running in bank-conflict-free `32×32` `shader-f16` + `unpack4x8snorm` WGSL shaders with 128-bit `vec4` I/O, `@workgroup_size(32)` `f16` FlashAttention, and zero-readback GPU-to-GPU World SH packing (**`9.7 ms`** pure GPU compute min / **`15.2–17.6 ms`** live alongside 60 fps 3D rendering on Apple M1 Metal 3 — **~10–18.7× faster than v1**, `60.3` steady / `63.0` live-drag fps, `0.00110` RMSE vs. PyTorch FP16).
+- **Cross-Browser Fallback:** Automatically runs WebGL2 `RGBA32F` `DataTexture` rendering + an off-main-thread L1-blocked Web Worker CPU fallback on browsers without WebGPU (e.g., Firefox macOS).
 - **Verified Zero-Shot Fidelity (`O1`–`O5`):** `30.71 dB` tone-mapped PSNR (`30.710 dB` INT8 / `30.712 dB` FP16; `31.27 dB` Cornell, `32.11 dB` Vaulted Atrium), `r = 0.9954` color-bleed spatial correlation, `2.6e-6` $SE(3)$ invariance drift, and `96.3%` vs. `95.5%` dynamic occlusion accuracy across `256` strictly unseen held-out rooms traced at `1,024` spp.
 
 ## Quick Start

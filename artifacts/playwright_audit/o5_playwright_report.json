@@ -14,25 +14,25 @@
   "external_requests": [],
   "all_renders_non_blank": true,
   "pixel_diffs_viewport": {
-    "cornell_gi_vs_direct_l1": 38.451,
-    "cornell_live_bleed_shift_l1": 44.984,
-    "lcorridor_open_vs_occluded_l1": 14.883
+    "cornell_gi_vs_direct_l1": 38.77,
+    "cornell_live_bleed_shift_l1": 45.217,
+    "lcorridor_open_vs_occluded_l1": 15.287
   },
   "gpu_indirect_rgb_checks": {
     "knot_before_rgb": [
-      0.2007,
-      0.207,
-      0.0978
+      0.2008,
+      0.2072,
+      0.0979
     ],
     "knot_after_shift_rgb": [
       0.2049,
-      0.1494,
+      0.1493,
       0.1592
     ],
-    "knot_chroma_shift_l2": 0.1663,
+    "knot_chroma_shift_l2": 0.1664,
     "east_sculpt_open_rgb": [
       0.0726,
-      0.0417,
+      0.0418,
       0.023
     ],
     "east_sculpt_occluded_rgb": [
@@ -40,12 +40,12 @@
       0.0133,
       0.0065
     ],
-    "corridor_occlusion_drop_ratio": 0.6688
+    "corridor_occlusion_drop_ratio": 0.6683
   },
   "performance_m1": {
-    "steady_fps": 60.6,
-    "live_drag_fps": 61.6,
-    "mean_gi_compute_ms": 47.65,
+    "steady_fps": 60.3,
+    "live_drag_fps": 63,
+    "mean_gi_compute_ms": 17.58,
     "n_tokens": 352
   },
   "screenshots": {
@@ -71,14 +71,14 @@
         3
       ],
       "mean_rgb": [
-        133.03,
-        144.37,
-        101.64
+        132.95,
+        143.58,
+        101.79
       ],
       "std_rgb": [
-        72.79,
-        76.65,
-        70.62
+        72.84,
+        77.35,
+        70.78
       ],
       "non_blank": true
     },
@@ -107,13 +107,13 @@
         3
       ],
       "mean_rgb": [
-        116.54,
-        133.26,
-        92.2
+        116.55,
+        133.27,
+        92.21
       ],
       "std_rgb": [
-        69.19,
-        76.41,
+        69.18,
+        76.42,
         66.27
       ],
       "non_blank": true
@@ -125,14 +125,14 @@
         3
       ],
       "mean_rgb": [
-        149.02,
-        140.78,
-        113.94
+        149.05,
+        140.83,
+        113.98
       ],
       "std_rgb": [
         56.61,
         54.67,
-        49.35
+        49.33
       ],
       "non_blank": true
     },
@@ -143,14 +143,14 @@
         3
       ],
       "mean_rgb": [
-        134.19,
-        145.37,
-        103.78
+        134.21,
+        145.39,
+        103.79
       ],
       "std_rgb": [
-        72.71,
+        72.7,
         76.22,
-        70.91
+        70.9
       ],
       "non_blank": true
     },
@@ -161,14 +161,14 @@
         3
       ],
       "mean_rgb": [
-        114.3,
-        101.84,
-        131.4
+        114.13,
+        101.96,
+        131.52
       ],
       "std_rgb": [
-        91.47,
-        77.7,
-        75.13
+        91.4,
+        77.58,
+        74.95
       ],
       "non_blank": true
     },
@@ -197,14 +197,14 @@
         3
       ],
       "mean_rgb": [
-        94.24,
-        78.6,
-        63.33
+        93.89,
+        78.57,
+        63.63
       ],
       "std_rgb": [
-        73.26,
-        67.6,
-        62.48
+        73.66,
+        67.95,
+        62.94
       ],
       "non_blank": true
     },
@@ -215,12 +215,12 @@
         3
       ],
       "mean_rgb": [
-        82.51,
-        67.66,
+        82.53,
+        67.67,
         54.12
       ],
       "std_rgb": [
-        74.25,
+        74.24,
         68.44,
         63.24
       ],
@@ -233,9 +233,9 @@
         3
       ],
       "mean_rgb": [
-        112.34,
-        108.4,
-        110.37
+        112.35,
+        108.41,
+        110.38
       ],
       "std_rgb": [
         83.37,
@@ -251,14 +251,14 @@
         3
       ],
       "mean_rgb": [
-        164.08,
-        139.76,
-        105.75
+        161.22,
+        137.42,
+        104.48
       ],
       "std_rgb": [
-        67.27,
-        67.27,
-        63.38
+        69.01,
+        68.26,
+        63.66
       ],
       "non_blank": true
     },
@@ -294,7 +294,7 @@
       "std_rgb": [
         36.33,
         51.29,
-        53.69
+        53.68
       ],
       "non_blank": true
     }

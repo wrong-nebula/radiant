@@ -217,56 +217,110 @@ function linearLayer(
   outDim: number,
   actGelu: boolean,
 ): void {
-  // 4-token x 4-input register-blocked GEMM (cuts weight RAM reads by 4x on CPU!)
+  // L1-cache-resident output-outer 4-output x 4-token blocked GEMM:
+  // Reads each 1 MB weight matrix ONCE from RAM instead of 88x (huge Firefox/CPU speedup!)
+  const outDim4 = outDim & ~3;
   const nTok4 = nTokens & ~3;
   const inDim4 = inDim & ~3;
-  for (let t = 0; t < nTok4; t += 4) {
-    const x0 = t * inDim;
-    const x1 = (t + 1) * inDim;
-    const x2 = (t + 2) * inDim;
-    const x3 = (t + 3) * inDim;
-    const y0 = t * outDim;
-    const y1 = (t + 1) * outDim;
-    const y2 = (t + 2) * outDim;
-    const y3 = (t + 3) * outDim;
-    for (let o = 0; o < outDim; o++) {
-      const b = w[bOff + o];
-      let a0 = b, a1 = b, a2 = b, a3 = b;
-      const wb = wOff + o * inDim;
+
+  for (let o = 0; o < outDim4; o += 4) {
+    const wb0 = wOff + (o + 0) * inDim;
+    const wb1 = wOff + (o + 1) * inDim;
+    const wb2 = wOff + (o + 2) * inDim;
+    const wb3 = wOff + (o + 3) * inDim;
+    const b0 = w[bOff + o], b1 = w[bOff + o + 1], b2 = w[bOff + o + 2], b3 = w[bOff + o + 3];
+
+    for (let t = 0; t < nTok4; t += 4) {
+      const x0 = t * inDim, x1 = (t + 1) * inDim, x2 = (t + 2) * inDim, x3 = (t + 3) * inDim;
+      let s00 = b0, s01 = b1, s02 = b2, s03 = b3;
+      let s10 = b0, s11 = b1, s12 = b2, s13 = b3;
+      let s20 = b0, s21 = b1, s22 = b2, s23 = b3;
+      let s30 = b0, s31 = b1, s32 = b2, s33 = b3;
+
       let k = 0;
       for (; k < inDim4; k += 4) {
-        const w0 = w[wb + k], w1 = w[wb + k + 1], w2 = w[wb + k + 2], w3 = w[wb + k + 3];
-        a0 += xIn[x0 + k] * w0 + xIn[x0 + k + 1] * w1 + xIn[x0 + k + 2] * w2 + xIn[x0 + k + 3] * w3;
-        a1 += xIn[x1 + k] * w0 + xIn[x1 + k + 1] * w1 + xIn[x1 + k + 2] * w2 + xIn[x1 + k + 3] * w3;
-        a2 += xIn[x2 + k] * w0 + xIn[x2 + k + 1] * w1 + xIn[x2 + k + 2] * w2 + xIn[x2 + k + 3] * w3;
-        a3 += xIn[x3 + k] * w0 + xIn[x3 + k + 1] * w1 + xIn[x3 + k + 2] * w2 + xIn[x3 + k + 3] * w3;
+        const w0a = w[wb0 + k], w0b = w[wb0 + k + 1], w0c = w[wb0 + k + 2], w0d = w[wb0 + k + 3];
+        const w1a = w[wb1 + k], w1b = w[wb1 + k + 1], w1c = w[wb1 + k + 2], w1d = w[wb1 + k + 3];
+        const w2a = w[wb2 + k], w2b = w[wb2 + k + 1], w2c = w[wb2 + k + 2], w2d = w[wb2 + k + 3];
+        const w3a = w[wb3 + k], w3b = w[wb3 + k + 1], w3c = w[wb3 + k + 2], w3d = w[wb3 + k + 3];
+
+        const xa0 = xIn[x0 + k], xb0 = xIn[x0 + k + 1], xc0 = xIn[x0 + k + 2], xd0 = xIn[x0 + k + 3];
+        s00 += xa0 * w0a + xb0 * w0b + xc0 * w0c + xd0 * w0d;
+        s01 += xa0 * w1a + xb0 * w1b + xc0 * w1c + xd0 * w1d;
+        s02 += xa0 * w2a + xb0 * w2b + xc0 * w2c + xd0 * w2d;
+        s03 += xa0 * w3a + xb0 * w3b + xc0 * w3c + xd0 * w3d;
+
+        const xa1 = xIn[x1 + k], xb1 = xIn[x1 + k + 1], xc1 = xIn[x1 + k + 2], xd1 = xIn[x1 + k + 3];
+        s10 += xa1 * w0a + xb1 * w0b + xc1 * w0c + xd1 * w0d;
+        s11 += xa1 * w1a + xb1 * w1b + xc1 * w1c + xd1 * w1d;
+        s12 += xa1 * w2a + xb1 * w2b + xc1 * w2c + xd1 * w2d;
+        s13 += xa1 * w3a + xb1 * w3b + xc1 * w3c + xd1 * w3d;
+
+        const xa2 = xIn[x2 + k], xb2 = xIn[x2 + k + 1], xc2 = xIn[x2 + k + 2], xd2 = xIn[x2 + k + 3];
+        s20 += xa2 * w0a + xb2 * w0b + xc2 * w0c + xd2 * w0d;
+        s21 += xa2 * w1a + xb2 * w1b + xc2 * w1c + xd2 * w1d;
+        s22 += xa2 * w2a + xb2 * w2b + xc2 * w2c + xd2 * w2d;
+        s23 += xa2 * w3a + xb2 * w3b + xc2 * w3c + xd2 * w3d;
+
+        const xa3 = xIn[x3 + k], xb3 = xIn[x3 + k + 1], xc3 = xIn[x3 + k + 2], xd3 = xIn[x3 + k + 3];
+        s30 += xa3 * w0a + xb3 * w0b + xc3 * w0c + xd3 * w0d;
+        s31 += xa3 * w1a + xb3 * w1b + xc3 * w1c + xd3 * w1d;
+        s32 += xa3 * w2a + xb3 * w2b + xc3 * w2c + xd3 * w2d;
+        s33 += xa3 * w3a + xb3 * w3b + xc3 * w3c + xd3 * w3d;
       }
       for (; k < inDim; k++) {
-        const wk = w[wb + k];
-        a0 += xIn[x0 + k] * wk;
-        a1 += xIn[x1 + k] * wk;
-        a2 += xIn[x2 + k] * wk;
-        a3 += xIn[x3 + k] * wk;
+        const w0k = w[wb0 + k], w1k = w[wb1 + k], w2k = w[wb2 + k], w3k = w[wb3 + k];
+        const xv0 = xIn[x0 + k], xv1 = xIn[x1 + k], xv2 = xIn[x2 + k], xv3 = xIn[x3 + k];
+        s00 += xv0 * w0k; s01 += xv0 * w1k; s02 += xv0 * w2k; s03 += xv0 * w3k;
+        s10 += xv1 * w0k; s11 += xv1 * w1k; s12 += xv1 * w2k; s13 += xv1 * w3k;
+        s20 += xv2 * w0k; s21 += xv2 * w1k; s22 += xv2 * w2k; s23 += xv2 * w3k;
+        s30 += xv3 * w0k; s31 += xv3 * w1k; s32 += xv3 * w2k; s33 += xv3 * w3k;
       }
+
       if (actGelu) {
-        a0 = geluTanh(a0); a1 = geluTanh(a1); a2 = geluTanh(a2); a3 = geluTanh(a3);
+        s00 = geluTanh(s00); s01 = geluTanh(s01); s02 = geluTanh(s02); s03 = geluTanh(s03);
+        s10 = geluTanh(s10); s11 = geluTanh(s11); s12 = geluTanh(s12); s13 = geluTanh(s13);
+        s20 = geluTanh(s20); s21 = geluTanh(s21); s22 = geluTanh(s22); s23 = geluTanh(s23);
+        s30 = geluTanh(s30); s31 = geluTanh(s31); s32 = geluTanh(s32); s33 = geluTanh(s33);
       }
+      const y0 = t * outDim + o, y1 = (t + 1) * outDim + o, y2 = (t + 2) * outDim + o, y3 = (t + 3) * outDim + o;
       if (resIn) {
-        a0 += resIn[y0 + o]; a1 += resIn[y1 + o]; a2 += resIn[y2 + o]; a3 += resIn[y3 + o];
+        s00 += resIn[y0]; s01 += resIn[y0 + 1]; s02 += resIn[y0 + 2]; s03 += resIn[y0 + 3];
+        s10 += resIn[y1]; s11 += resIn[y1 + 1]; s12 += resIn[y1 + 2]; s13 += resIn[y1 + 3];
+        s20 += resIn[y2]; s21 += resIn[y2 + 1]; s22 += resIn[y2 + 2]; s23 += resIn[y2 + 3];
+        s30 += resIn[y3]; s31 += resIn[y3 + 1]; s32 += resIn[y3 + 2]; s33 += resIn[y3 + 3];
       }
-      yOut[y0 + o] = a0; yOut[y1 + o] = a1; yOut[y2 + o] = a2; yOut[y3 + o] = a3;
+      yOut[y0] = s00; yOut[y0 + 1] = s01; yOut[y0 + 2] = s02; yOut[y0 + 3] = s03;
+      yOut[y1] = s10; yOut[y1 + 1] = s11; yOut[y1 + 2] = s12; yOut[y1 + 3] = s13;
+      yOut[y2] = s20; yOut[y2 + 1] = s21; yOut[y2 + 2] = s22; yOut[y2 + 3] = s23;
+      yOut[y3] = s30; yOut[y3 + 1] = s31; yOut[y3 + 2] = s32; yOut[y3 + 3] = s33;
+    }
+
+    for (let t = nTok4; t < nTokens; t++) {
+      const xb = t * inDim;
+      let s0 = b0, s1 = b1, s2 = b2, s3 = b3;
+      for (let k = 0; k < inDim; k++) {
+        const xv = xIn[xb + k];
+        s0 += xv * w[wb0 + k]; s1 += xv * w[wb1 + k]; s2 += xv * w[wb2 + k]; s3 += xv * w[wb3 + k];
+      }
+      if (actGelu) { s0 = geluTanh(s0); s1 = geluTanh(s1); s2 = geluTanh(s2); s3 = geluTanh(s3); }
+      const yb = t * outDim + o;
+      if (resIn) { s0 += resIn[yb]; s1 += resIn[yb + 1]; s2 += resIn[yb + 2]; s3 += resIn[yb + 3]; }
+      yOut[yb] = s0; yOut[yb + 1] = s1; yOut[yb + 2] = s2; yOut[yb + 3] = s3;
     }
   }
-  for (let t = nTok4; t < nTokens; t++) {
-    const xb = t * inDim;
-    const yb = t * outDim;
-    for (let o = 0; o < outDim; o++) {
-      let acc = w[bOff + o];
-      const wb = wOff + o * inDim;
+
+  for (let o = outDim4; o < outDim; o++) {
+    const wb = wOff + o * inDim;
+    const b = w[bOff + o];
+    for (let t = 0; t < nTokens; t++) {
+      const xb = t * inDim;
+      let acc = b;
       for (let k = 0; k < inDim; k++) acc += xIn[xb + k] * w[wb + k];
       if (actGelu) acc = geluTanh(acc);
-      if (resIn) acc += resIn[yb + o];
-      yOut[yb + o] = acc;
+      const yb = t * outDim + o;
+      if (resIn) acc += resIn[yb];
+      yOut[yb] = acc;
     }
   }
 }
@@ -473,15 +527,18 @@ export async function runRadiantCPU(
             mMax = score;
             lSum = 1.0;
             for (let d = 0; d < 32; d++) accVec[d] = V[kb + d];
-          } else {
-            const newM = score > mMax ? score : mMax;
-            const rescale = Math.exp(Math.max(mMax - newM, -80.0));
-            const wt = Math.exp(Math.max(score - newM, -80.0));
-            lSum = lSum * rescale + wt;
-            for (let d = 0; d < 32; d++) {
-              accVec[d] = accVec[d] * rescale + V[kb + d] * wt;
+          } else if (score <= mMax) {
+            const diff = score - mMax;
+            if (diff > -14.0) {
+              const wt = Math.exp(diff);
+              lSum += wt;
+              for (let d = 0; d < 32; d++) accVec[d] += V[kb + d] * wt;
             }
-            mMax = newM;
+          } else {
+            const rescale = Math.exp(Math.max(mMax - score, -80.0));
+            lSum = lSum * rescale + 1.0;
+            for (let d = 0; d < 32; d++) accVec[d] = accVec[d] * rescale + V[kb + d];
+            mMax = score;
           }
         }
 
