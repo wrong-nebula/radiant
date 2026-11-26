@@ -800,9 +800,8 @@ export class RadiantComputeEngine {
     this._createPipelines();
   }
 
-  public static async createFromRenderer(
+  public static async createUnloadedFromRenderer(
     renderer: THREE.WebGPURenderer,
-    weightsUrl: string,
   ): Promise<RadiantComputeEngine> {
     const backend = (renderer as any).backend;
     let device: GPUDevice | undefined = backend?.device;
@@ -814,9 +813,21 @@ export class RadiantComputeEngine {
       if (!adapter) throw new Error('Failed to acquire WebGPU adapter');
       device = await adapter.requestDevice();
     }
-    const engine = new RadiantComputeEngine(device);
-    await engine.loadWeightsFromUrl(weightsUrl);
+    return new RadiantComputeEngine(device);
+  }
+
+  public static async createFromRenderer(
+    renderer: THREE.WebGPURenderer,
+    weightsUrl: string,
+    onProgress?: (loadedBytes: number, totalBytes: number) => void,
+  ): Promise<RadiantComputeEngine> {
+    const engine = await RadiantComputeEngine.createUnloadedFromRenderer(renderer);
+    await engine.loadWeightsFromUrl(weightsUrl, onProgress);
     return engine;
+  }
+
+  public get isWeightsLoaded(): boolean {
+    return this.weightsBuf !== null;
   }
 
   public static async createStandalone(weightsUrlOrBuffer: string | ArrayBuffer): Promise<RadiantComputeEngine> {
@@ -923,13 +934,40 @@ export class RadiantComputeEngine {
     });
   }
 
-  public async loadWeightsFromUrl(url: string): Promise<void> {
+  public async loadWeightsFromUrl(
+    url: string,
+    onProgress?: (loadedBytes: number, totalBytes: number) => void,
+  ): Promise<void> {
     const resp = await fetch(url);
     if (!resp.ok) {
       throw new Error(`Failed to fetch RDGI weights from ${url}: HTTP ${resp.status}`);
     }
-    const buf = await resp.arrayBuffer();
-    this.loadWeightsFromBuffer(buf);
+    const total = Number(resp.headers.get('content-length') || '0');
+    if (resp.body && onProgress) {
+      const reader = resp.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let loaded = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          loaded += value.byteLength;
+          onProgress(loaded, total);
+        }
+      }
+      const merged = new Uint8Array(loaded);
+      let off = 0;
+      for (const c of chunks) {
+        merged.set(c, off);
+        off += c.byteLength;
+      }
+      this.loadWeightsFromBuffer(merged.buffer);
+    } else {
+      const buf = await resp.arrayBuffer();
+      if (onProgress) onProgress(buf.byteLength, buf.byteLength);
+      this.loadWeightsFromBuffer(buf);
+    }
   }
 
   public loadWeightsFromBuffer(buffer: ArrayBuffer): void {
@@ -1129,6 +1167,7 @@ export class RadiantComputeEngine {
     try {
       const nTokens = Math.floor(tokens.length / TOKEN_STRIDE);
       if (nTokens <= 0) return new Float32Array(0);
+      if (!this.weightsBuf) return new Float32Array(nTokens * SH_STRIDE);
       this._ensureCapacity(nTokens);
 
       const t0 = performance.now();

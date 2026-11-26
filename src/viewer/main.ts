@@ -147,24 +147,45 @@ class RadiantShowcaseApp {
     });
     this.scene.add(this.transform.getHelper());
 
-    // Load native WebGPU Compute Engine + FP16 RDGI weights
-    this.engine = await RadiantComputeEngine.createFromRenderer(this.renderer, WEIGHTS_URL);
-    const badge = document.getElementById('gpu-badge');
-    if (badge) {
-      badge.textContent = `WebGPU · ${this.engine.header.nLayers}L FP16`;
-    }
-
+    // Create WebGPU Compute Engine immediately so Room 1 renders on Frame 1 (zero blank screen!)
+    this.engine = await RadiantComputeEngine.createUnloadedFromRenderer(this.renderer);
     this._wireUI();
-    await this.loadRoom(0);
-
     window.addEventListener('resize', () => {
       this.camera.aspect = window.innerWidth / window.innerHeight;
       this.camera.updateProjectionMatrix();
       this.renderer.setSize(window.innerWidth, window.innerHeight);
     });
 
-    this.resolveReady();
+    // Show Cornell Box immediately with direct light while FP16 weights stream in
+    await this.loadRoom(0);
     this._animate();
+
+    const elSt = document.getElementById('m-state');
+    const toastEl = document.getElementById('toast');
+    if (elSt) elSt.textContent = 'LOADING';
+    if (toastEl) {
+      toastEl.textContent = 'Loading RADIANT FP16 weights (13.2 MB)...';
+      toastEl.classList.remove('hidden');
+    }
+
+    await this.engine.loadWeightsFromUrl(WEIGHTS_URL, (loaded, total) => {
+      const mbLoaded = (loaded / (1024 * 1024)).toFixed(1);
+      const mbTotal = total > 0 ? (total / (1024 * 1024)).toFixed(1) : '13.2';
+      if (toastEl) {
+        toastEl.textContent = `Loading RADIANT FP16 weights (${mbLoaded} / ${mbTotal} MB)...`;
+        toastEl.classList.remove('hidden');
+      }
+    });
+
+    const badge = document.getElementById('gpu-badge');
+    if (badge) {
+      badge.textContent = `WebGPU · ${this.engine.header.nLayers}L FP16`;
+    }
+
+    // Compute live 3-bounce indirect GI the instant weights finish downloading!
+    await this.recomputeGI();
+    this._showToast('RADIANT-GI Ready — drag any wall, lamp, or sculpture live!');
+    this.resolveReady();
   }
 
   private _syncSelectedLight(): void {
@@ -798,7 +819,7 @@ class RadiantShowcaseApp {
       this.currentFps = (this.frameCount / this.fpsAccumTime) * 1000;
       const elFps = document.getElementById('m-fps');
       if (elFps) elFps.textContent = `${Math.round(this.currentFps)}`;
-      if (!this.giDirty && !this.computeInFlight) {
+      if (!this.giDirty && !this.computeInFlight && this.engine?.isWeightsLoaded) {
         const elMs = document.getElementById('m-gi-ms');
         const elSt = document.getElementById('m-state');
         if (elMs) elMs.textContent = '0.0 ms';
