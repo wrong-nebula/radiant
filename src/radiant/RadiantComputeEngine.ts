@@ -715,12 +715,15 @@ export const WORLD_PATCH_VEC4S = 6;
 export const MAX_RENDER_PATCHES = 1024;
 
 export class RadiantComputeEngine {
-  public readonly device: GPUDevice | null;
-  public readonly isCPUFallback: boolean;
+  public device: GPUDevice | null;
+  public isCPUFallback: boolean;
+  /** True whenever the Three.js renderer is using WebGLBackend (must read DataTexture, not storage()). */
+  public readonly useTextureLookup: boolean;
   public header!: RDGIHeader;
   private layout!: WeightLayout;
   private weightsBuf: GPUBuffer | null = null;
   private cpuWeightsF32: Float32Array | null = null;
+  private rawWeightsBuffer: ArrayBuffer | null = null;
 
   // Compute pipelines
   private pipeCentroid!: GPUComputePipeline;
@@ -798,9 +801,10 @@ export class RadiantComputeEngine {
   private isBusy = false;
   private inferQueue: Promise<unknown> = Promise.resolve();
 
-  constructor(device: GPUDevice | null) {
+  constructor(device: GPUDevice | null, useTextureLookup = false) {
     this.device = device;
     this.isCPUFallback = device === null;
+    this.useTextureLookup = useTextureLookup || device === null;
     this.worldPatchStorage = new THREE.StorageBufferAttribute(this.worldPatchArray, 4);
     this.worldPatchTexture = new THREE.DataTexture(
       this.worldPatchArray,
@@ -814,7 +818,13 @@ export class RadiantComputeEngine {
     this.worldPatchTexture.generateMipmaps = false;
     this.worldPatchTexture.needsUpdate = true;
     if (this.device) {
-      this._createPipelines();
+      try {
+        this._createPipelines();
+      } catch (err) {
+        console.warn('[RadiantComputeEngine] WebGPU compute pipeline init failed, falling back to CPU:', err);
+        this.device = null;
+        this.isCPUFallback = true;
+      }
     }
   }
 
@@ -822,6 +832,7 @@ export class RadiantComputeEngine {
     renderer: THREE.WebGPURenderer,
   ): Promise<RadiantComputeEngine> {
     const backend = (renderer as any).backend;
+    const isWebGLRenderer = Boolean(backend?.isWebGLBackend) || !backend?.device;
     let device: GPUDevice | null = backend?.device ?? null;
     if (!device && typeof navigator !== 'undefined' && navigator.gpu) {
       try {
@@ -833,7 +844,7 @@ export class RadiantComputeEngine {
         device = null;
       }
     }
-    return new RadiantComputeEngine(device);
+    return new RadiantComputeEngine(device, isWebGLRenderer);
   }
 
   public static async createFromRenderer(
@@ -1069,6 +1080,7 @@ export class RadiantComputeEngine {
       finalNormW, head1W, head1B, head2W, head2B,
     };
 
+    this.rawWeightsBuffer = buffer;
     if (this.isCPUFallback || !this.device) {
       this.cpuWeightsF32 = unpackRDGIWeightsF32(buffer);
       return;
@@ -1344,7 +1356,23 @@ export class RadiantComputeEngine {
 
       const outBytes = nTokens * SH_STRIDE * 4;
       enc.copyBufferToBuffer(this.shOutBuf, 0, this.readbackBuf, 0, outBytes);
+      let gpuValidationErr: GPUError | null = null;
+      if (this.useTextureLookup && typeof this.device.pushErrorScope === 'function') {
+        this.device.pushErrorScope('validation');
+      }
       this.device.queue.submit([enc.finish()]);
+      if (this.useTextureLookup && typeof this.device.popErrorScope === 'function') {
+        gpuValidationErr = await this.device.popErrorScope();
+      }
+      if (gpuValidationErr) {
+        console.warn('[RadiantComputeEngine] WebGPU compute validation error, switching to CPU fallback:', gpuValidationErr.message);
+        this.device = null;
+        this.isCPUFallback = true;
+        if (!this.cpuWeightsF32 && this.rawWeightsBuffer) {
+          this.cpuWeightsF32 = unpackRDGIWeightsF32(this.rawWeightsBuffer);
+        }
+        return this._runInferTokens(tokens, updateWorldStorage);
+      }
 
       await this.readbackBuf.mapAsync(GPUMapMode.READ, 0, outBytes);
       const mapped = new Float32Array(this.readbackBuf.getMappedRange(0, outBytes));

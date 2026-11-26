@@ -71,7 +71,7 @@ export function buildRadiantGINode(
   roughnessVal = 0.8,
   metalnessVal = 0.0,
 ) {
-  const useTextureFallback = engine.isCPUFallback;
+  const useTextureFallback = engine.useTextureLookup;
   const patchBuf = useTextureFallback
     ? null
     : storage(
@@ -80,11 +80,11 @@ export function buildRadiantGINode(
         MAX_RENDER_PATCHES * WORLD_PATCH_VEC4S,
       ).toReadOnly();
   const patchTex = engine.worldPatchTexture;
-  const objRow = int(objectId);
-
-  const patchStart = int(objectId * PATCHES_PER_OBJECT);
-  const roughF = float(Math.min(1.0, Math.max(0.08, roughnessVal)));
-  const metalF = float(Math.min(1.0, Math.max(0.0, metalnessVal)));
+  // Use uniforms (not compile-time constants!) so all objects in a room share ONE compiled shader program!
+  const objRow = uniform(objectId, 'int');
+  const patchStart = uniform(objectId * PATCHES_PER_OBJECT, 'int');
+  const roughF = uniform(Math.min(1.0, Math.max(0.08, roughnessVal)), 'float');
+  const metalF = uniform(Math.min(1.0, Math.max(0.0, metalnessVal)), 'float');
 
   // Plain TSL builder function (inlined cleanly inside giContribution Fn!)
   const evalBilateralSH = () => {
@@ -232,16 +232,18 @@ export function applyRadiantGI(
   const isEmitter = options?.isEmitter ?? false;
 
   const baseColor = material.color.clone();
-  const baseAlbedoScalar = vec3(baseColor.r, baseColor.g, baseColor.b);
+  const baseAlbedoScalar = uniform(new THREE.Vector3(baseColor.r, baseColor.g, baseColor.b));
   const albedoMap = material.map;
-  const baseEmissive = material.emissive
-    ? vec3(
-        material.emissive.r * material.emissiveIntensity,
-        material.emissive.g * material.emissiveIntensity,
-        material.emissive.b * material.emissiveIntensity,
-      )
-    : vec3(0.0, 0.0, 0.0);
-  const metalF = float(metalVal);
+  const baseEmissive = uniform(
+    material.emissive
+      ? new THREE.Vector3(
+          material.emissive.r * material.emissiveIntensity,
+          material.emissive.g * material.emissiveIntensity,
+          material.emissive.b * material.emissiveIntensity,
+        )
+      : new THREE.Vector3(0.0, 0.0, 0.0),
+  );
+  const metalF = uniform(metalVal, 'float');
 
   const giContribution = Fn(() => {
     const sh = evalBilateralSH();

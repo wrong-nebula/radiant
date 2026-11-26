@@ -102,10 +102,14 @@ class RadiantShowcaseApp {
   }
 
   private async _init(): Promise<void> {
+    // Firefox macOS WebGPU (wgpu) still has swap-chain/TSL blank-canvas bugs in Three.js WebGPURenderer;
+    // render via Firefox's rock-solid ANGLE Metal WebGL2 backend while still using WebGPU Compute (or CPU fallback)!
+    const isFirefox = typeof navigator !== 'undefined' && /Firefox\//i.test(navigator.userAgent);
     this.renderer = new THREE.WebGPURenderer({
       canvas: this.canvas,
       antialias: true,
       powerPreference: 'high-performance',
+      forceWebGL: isFirefox,
     });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -172,9 +176,13 @@ class RadiantShowcaseApp {
 
     const badge = document.getElementById('gpu-badge');
     if (badge) {
-      badge.textContent = this.engine.isCPUFallback
-        ? `WebGL2 · ${this.engine.header.nLayers}L CPU GI`
-        : `WebGPU · ${this.engine.header.nLayers}L FP16`;
+      if (this.engine.isCPUFallback) {
+        badge.textContent = `WebGL2 · ${this.engine.header.nLayers}L CPU GI`;
+      } else if (this.engine.useTextureLookup) {
+        badge.textContent = `WebGL2 + WebGPU · ${this.engine.header.nLayers}L`;
+      } else {
+        badge.textContent = `WebGPU · ${this.engine.header.nLayers}L FP16`;
+      }
     }
 
     // Compute live 3-bounce indirect GI the instant weights finish downloading!
