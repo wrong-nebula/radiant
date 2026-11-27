@@ -93,6 +93,11 @@ def export_radiant_fp16_bin(
     sd = model.state_dict()
     names = canonical_tensor_names(model.n_layers)
 
+    flags = (
+        1
+        | (2 if getattr(model, "area_prior", False) else 0)
+        | (4 if getattr(model, "multi_bounce", False) else 0)
+    )
     header = struct.pack(
         "<4s7If28s",
         b"RDGI",
@@ -102,7 +107,7 @@ def export_radiant_fp16_bin(
         model.n_layers,
         model.d_ff,
         len(names),
-        1,  # flags: fp16
+        flags,  # bit0: fp16, bit1: area_prior (+log A_j), bit2: multi_bounce (36-ch [b1, b2, b3])
         float(POS_SCALE_METERS),
         b"\x00" * 28,
     )
@@ -138,7 +143,16 @@ def load_radiant_fp16_bin(bin_path: Path, device: str | torch.device = "cpu") ->
     assert magic == b"RDGI" and version == 1, f"Invalid RDGI header: {magic} v{version}"
     assert abs(pos_scale - POS_SCALE_METERS) < 1e-4
 
-    model = RadiantGITransformer(d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff)
+    area_prior = bool(flags & 2)
+    multi_bounce = bool(flags & 4)
+    model = RadiantGITransformer(
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        d_ff=d_ff,
+        area_prior=area_prior,
+        multi_bounce=multi_bounce,
+    )
     sd = model.state_dict()
     names = canonical_tensor_names(n_layers)
     assert len(names) == n_tensors
@@ -163,38 +177,47 @@ def export_parity_probes(
     heldout_data: dict[str, np.ndarray],
     out_path: Path,
     n_probes: int = 4,
+    mixed_lod_data: dict[str, np.ndarray] | None = None,
+    n_lod_probes: int = 2,
 ) -> dict:
-    """Generate locked PyTorch FP16-weight reference outputs on matched held-out scenes for O4 WGSL parity."""
+    """Generate locked PyTorch FP16-weight reference outputs on matched held-out scenes (uniform-32 + Mixed-LOD) for O4 WGSL parity."""
     model = load_radiant_fp16_bin(fp16_bin_path, device="cpu")
-    offsets = heldout_data["scene_offsets"]
-    tok_all = heldout_data["tokens_fp16"]
-    tgt_all = heldout_data["targets_fp16"]
-    oids_all = heldout_data["object_ids"]
-
     probes = []
-    for i in range(min(n_probes, len(offsets) - 1)):
-        s, e = int(offsets[i]), int(offsets[i + 1])
-        tok = tok_all[s:e].astype(np.float32)
-        gt = tgt_all[s:e].astype(np.float32)
-        oid = oids_all[s:e].astype(np.int32)
-        pred = model(torch.from_numpy(tok).unsqueeze(0)).squeeze(0).numpy().astype(np.float32)
-        probes.append(
-            {
-                "scene_index": i,
-                "n_tokens": int(e - s),
-                "psnr_vs_gt_db": round(tonemapped_psnr_db(pred[:, 0:3], gt[:, 0:3]), 3),
-                "rmse_vs_gt": round(sh_rmse(pred, gt), 5),
-                "tokens": np.round(tok, 6).tolist(),
-                "object_ids": oid.tolist(),
-                "gt_sh": np.round(gt, 6).tolist(),
-                "pytorch_fp16_ref_sh": np.round(pred, 6).tolist(),
-            }
-        )
+
+    def _append_from(dataset: dict[str, np.ndarray], count: int, lod_tag: str) -> None:
+        offsets = dataset["scene_offsets"]
+        tok_all = dataset["tokens_fp16"]
+        tgt_all = dataset["targets_fp16"]
+        oids_all = dataset["object_ids"]
+        for i in range(min(count, len(offsets) - 1)):
+            s, e = int(offsets[i]), int(offsets[i + 1])
+            tok = tok_all[s:e].astype(np.float32)
+            gt = tgt_all[s:e].astype(np.float32)
+            oid = oids_all[s:e].astype(np.int32)
+            pred = model(torch.from_numpy(tok).unsqueeze(0)).squeeze(0).numpy().astype(np.float32)
+            probes.append(
+                {
+                    "scene_index": len(probes),
+                    "lod_mode": lod_tag,
+                    "n_tokens": int(e - s),
+                    "psnr_vs_gt_db": round(tonemapped_psnr_db(pred[:, 0:3], gt[:, 0:3]), 3),
+                    "rmse_vs_gt": round(sh_rmse(pred, gt), 5),
+                    "tokens": np.round(tok, 6).tolist(),
+                    "object_ids": oid.tolist(),
+                    "gt_sh": np.round(gt, 6).tolist(),
+                    "pytorch_fp16_ref_sh": np.round(pred, 6).tolist(),
+                }
+            )
+
+    _append_from(heldout_data, n_probes, "fixed32")
+    if mixed_lod_data is not None and n_lod_probes > 0:
+        _append_from(mixed_lod_data, n_lod_probes, "distance_lod")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format": "RADIANT_O4_PARITY_PROBES_V1",
+        "format": "RADIANT_O4_PARITY_PROBES_V2",
         "pos_scale_meters": POS_SCALE_METERS,
+        "area_prior": bool(getattr(model, "area_prior", False)),
         "n_probes": len(probes),
         "probes": probes,
     }

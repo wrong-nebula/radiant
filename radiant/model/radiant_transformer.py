@@ -91,11 +91,12 @@ class RadiantSE3FormFactorAttention(nn.Module):
     yielding 6 exact SE(3)-invariant directional geometric readout features per head.
     """
 
-    def __init__(self, d_model: int = 256, n_heads: int = 8) -> None:
+    def __init__(self, d_model: int = 256, n_heads: int = 8, area_prior: bool = True) -> None:
         super().__init__()
         assert d_model == n_heads * 32, "Requires d_head == 32 (d_sem=19 + d_geo=13, d_v_inv=26 + d_v_geo=6)"
         self.d_model = d_model
         self.n_heads = n_heads
+        self.area_prior = bool(area_prior)
         self.d_sem = 19
         self.d_geo = 13
         self.d_v_inv = 26
@@ -130,6 +131,7 @@ class RadiantSE3FormFactorAttention(nn.Module):
         T: torch.Tensor,         # [B, N, 3] unit tangent (float32)
         B_vec: torch.Tensor,     # [B, N, 3] unit bitangent (float32)
         N_vec: torch.Tensor,     # [B, N, 3] unit normal (float32)
+        log_area_prior: torch.Tensor | None = None,  # [B, N, 1] log(max(A_j, 1e-4)) (float32)
         attn_mask: torch.Tensor | None = None,  # [B, 1, 1, N] bool (True = valid key)
     ) -> torch.Tensor:
         B_sz, N_tok, _ = x.shape
@@ -175,13 +177,19 @@ class RadiantSE3FormFactorAttention(nn.Module):
             dim=-1,
         ).to(q_sem.dtype)  # [B, N, H, 13]
 
+        k_scalar = -beta * pn2_h - (v_w * pe_h).sum(dim=-1, keepdim=True)
+        if self.area_prior and log_area_prior is not None:
+            # Exact Riemann surface-area measure: softmax(score + log A_j) = A_j * exp(score) / sum_k A_k * exp(score)
+            # Makes attention mathematically invariant to subdividing or coarsening patch LODs (4..64)!
+            k_scalar = k_scalar + log_area_prior.unsqueeze(2)
+
         k_geo = torch.cat(
             [
                 pe_h,                                                  # 3
                 ones,                                                  # 1
                 pn2_h,                                                 # 1
                 2.0 * beta * pe_h + v_w,                               # 3
-                -beta * pn2_h - (v_w * pe_h).sum(dim=-1, keepdim=True),  # 1
+                k_scalar,                                              # 1
                 -beta,                                                 # 1
                 r_w,                                                   # 3
             ],
@@ -226,10 +234,10 @@ class RadiantSE3FormFactorAttention(nn.Module):
 
 
 class RadiantBlock(nn.Module):
-    def __init__(self, d_model: int = 256, n_heads: int = 8, d_ff: int = 1024) -> None:
+    def __init__(self, d_model: int = 256, n_heads: int = 8, d_ff: int = 1024, area_prior: bool = True) -> None:
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn = RadiantSE3FormFactorAttention(d_model=d_model, n_heads=n_heads)
+        self.attn = RadiantSE3FormFactorAttention(d_model=d_model, n_heads=n_heads, area_prior=area_prior)
         self.norm2 = RMSNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_ff, bias=True)
         self.fc2 = nn.Linear(d_ff, d_model, bias=True)
@@ -242,16 +250,26 @@ class RadiantBlock(nn.Module):
         T: torch.Tensor,
         B_vec: torch.Tensor,
         N_vec: torch.Tensor,
+        log_area_prior: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), p_hat, p_norm2, T, B_vec, N_vec, attn_mask=attn_mask)
+        x = x + self.attn(
+            self.norm1(x),
+            p_hat,
+            p_norm2,
+            T,
+            B_vec,
+            N_vec,
+            log_area_prior=log_area_prior,
+            attn_mask=attn_mask,
+        )
         h = F.gelu(self.fc1(self.norm2(x)), approximate="tanh")
         x = x + self.fc2(h)
         return x
 
 
 class RadiantGITransformer(nn.Module):
-    """H2: Exact SE(3)-Invariant RADIANT-GI Form-Factor Transformer."""
+    """H2: Exact SE(3)-Invariant RADIANT-GI Form-Factor Transformer (Riemann Area-Prior + 1/2/3-Bounce Neumann Head)."""
 
     def __init__(
         self,
@@ -259,30 +277,38 @@ class RadiantGITransformer(nn.Module):
         n_heads: int = 8,
         n_layers: int = 9,
         d_ff: int = 1024,
+        area_prior: bool = True,
+        multi_bounce: bool = False,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.d_ff = d_ff
+        self.area_prior = bool(area_prior)
+        self.multi_bounce = bool(multi_bounce)
+        self.out_dim = 36 if self.multi_bounce else 12
 
         self.stem1 = nn.Linear(INTRINSIC_FEAT_DIM, d_model, bias=True)
         self.stem2 = nn.Linear(d_model, d_model, bias=True)
-        self.blocks = nn.ModuleList([RadiantBlock(d_model, n_heads, d_ff) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([RadiantBlock(d_model, n_heads, d_ff, area_prior=self.area_prior) for _ in range(n_layers)])
         self.final_norm = RMSNorm(d_model)
         self.head1 = nn.Linear(d_model, d_model, bias=True)
-        self.head2 = nn.Linear(d_model, 12, bias=True)
+        self.head2 = nn.Linear(d_model, self.out_dim, bias=True)
 
     def forward(
         self,
         tokens: torch.Tensor,                    # [B, N, 21]
         valid_mask: torch.Tensor | None = None,  # [B, N] bool (True = real patch, False = padding)
+        return_bounces: bool = False,
     ) -> torch.Tensor:
-        """Return predicted local Order-1 SH [B, N, 12]."""
+        """Return predicted local Order-1 SH [B, N, 12] (3-bounce total) or [B, N, 36] ([b1, b2, b3]) if return_bounces=True."""
         pos = tokens[..., 0:3].float()
         T = tokens[..., 3:6].float()
         B_vec = tokens[..., 6:9].float()
         N_vec = tokens[..., 9:12].float()
+        area = torch.clamp(tokens[..., 12:13].float(), min=1e-4)
+        log_area_prior = torch.log(area) if self.area_prior else None
 
         # Exact translation-invariant centering over valid patches only
         if valid_mask is not None:
@@ -301,11 +327,18 @@ class RadiantGITransformer(nn.Module):
         x = self.stem2(F.gelu(self.stem1(feats), approximate="tanh"))
 
         for blk in self.blocks:
-            x = blk(x, p_hat, p_norm2, T, B_vec, N_vec, attn_mask=attn_mask)
+            x = blk(x, p_hat, p_norm2, T, B_vec, N_vec, log_area_prior=log_area_prior, attn_mask=attn_mask)
 
         x = self.final_norm(x)
-        raw = self.head2(F.gelu(self.head1(x), approximate="tanh"))
-        return decode_sh_raw(raw.float())
+        raw = self.head2(F.gelu(self.head1(x), approximate="tanh")).float()
+        if self.multi_bounce:
+            b1 = decode_sh_raw(raw[..., 0:12])
+            b2 = decode_sh_raw(raw[..., 12:24])
+            b3 = decode_sh_raw(raw[..., 24:36])
+            if return_bounces:
+                return torch.cat([b1, b2, b3], dim=-1)
+            return b1 + b2 + b3
+        return decode_sh_raw(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -429,3 +462,39 @@ def radiant_gi_loss(
         "sh_cos": float(loss_sh_cos.detach().item()),
     }
     return total, stats
+
+
+def radiant_gi_multibounce_loss(
+    pred_36: torch.Tensor,      # [B, N, 36] float32 ([b1, b2, b3])
+    gt_36: torch.Tensor,        # [B, N, 36] float32 ([gt_b1, gt_b2, gt_b3])
+    valid_mask: torch.Tensor,   # [B, N] bool
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Neumann-series multi-bounce loss supervising 1-bounce, 2-bounce, 3-bounce totals + individual bounce deltas."""
+    p_b1 = pred_36[..., 0:12]
+    p_b2 = pred_36[..., 12:24]
+    p_b3 = pred_36[..., 24:36]
+    g_b1 = gt_36[..., 0:12]
+    g_b2 = gt_36[..., 12:24]
+    g_b3 = gt_36[..., 24:36]
+
+    p_1b = p_b1
+    p_2b = p_b1 + p_b2
+    p_3b = p_2b + p_b3
+    g_1b = g_b1
+    g_2b = g_b1 + g_b2
+    g_3b = g_2b + g_b3
+
+    l_3b, s_3b = radiant_gi_loss(p_3b, g_3b, valid_mask)
+    l_2b, _ = radiant_gi_loss(p_2b, g_2b, valid_mask)
+    l_1b, _ = radiant_gi_loss(p_1b, g_1b, valid_mask)
+    l_d2, _ = radiant_gi_loss(p_b2, g_b2, valid_mask)
+    l_d3, _ = radiant_gi_loss(p_b3, g_b3, valid_mask)
+
+    total = l_3b + 0.35 * l_2b + 0.35 * l_1b + 0.15 * l_d2 + 0.15 * l_d3
+    return total, {
+        "loss": float(total.detach().item()),
+        "l3": float(l_3b.detach().item()),
+        "l2": float(l_2b.detach().item()),
+        "l1": float(l_1b.detach().item()),
+        "sh_cos": s_3b["sh_cos"],
+    }

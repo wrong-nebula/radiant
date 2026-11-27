@@ -10,6 +10,10 @@
 import * as THREE from 'three/webgpu';
 import { PATCHES_PER_OBJECT, TOKEN_STRIDE, buildFrisvadBasis } from './shMath.ts';
 
+export const LOD_PATCH_COUNTS = [4, 8, 16, 32, 64] as const;
+export type PatchLOD = (typeof LOD_PATCH_COUNTS)[number];
+export type LODMode = 'auto' | 'hero' | 'fixed32' | 'eco';
+
 export interface LocalPatch {
   px: number; py: number; pz: number;
   tx: number; ty: number; tz: number;
@@ -23,7 +27,12 @@ export interface LocalPatch {
 export interface LocalObjectTokens {
   objectId: number;
   mesh: THREE.Mesh;
-  patches: LocalPatch[]; // length 32
+  patches: LocalPatch[]; // active LOD patches (default 32)
+  /** Precomputed Multi-LOD patch pyramid (4, 8, 16, 32, 64) for zero-cost distance switching */
+  lods?: Partial<Record<PatchLOD, LocalPatch[]>>;
+  activeLod: PatchLOD;
+  patchStart: number;
+  localRadius: number;
   albedo: [number, number, number];
   roughness: number;
   metallic: number;
@@ -106,10 +115,10 @@ function extractLocalTriangles(geometry: THREE.BufferGeometry): TriData {
     }
   }
 
-  // Subdivide low-poly meshes (like 12-tri BoxGeometry walls) so 32 patches tile faces evenly
+  // Subdivide low-poly meshes (like 12-tri BoxGeometry walls) so up to 64 LOD patches tile faces evenly
   let count = initCount;
   const areaScaleFactor = rawTriCount > maxSampleTris ? rawTriCount / initCount : 1.0;
-  while (count < 128 && count > 0) {
+  while (count < 256 && count > 0) {
     const next = count * 4;
     const n0x = new Float32Array(next), n0y = new Float32Array(next), n0z = new Float32Array(next);
     const n1x = new Float32Array(next), n1y = new Float32Array(next), n1z = new Float32Array(next);
@@ -224,16 +233,16 @@ export function extractMaterialProps(mesh: THREE.Mesh): {
 /**
  * Deterministically cluster any Three.js Mesh into 32 local-space surface-patch tokens.
  */
-export function sampleMeshPatches(
+function clusterTrianglesToPatches(
+  tris: TriData,
   mesh: THREE.Mesh,
-  objectId: number,
-  nPatches: number = PATCHES_PER_OBJECT,
-  lloydIters: number = 6,
-  normalWeight: number = 0.45,
-): LocalObjectTokens {
-  const tris = extractLocalTriangles(mesh.geometry);
+  matProps: ReturnType<typeof extractMaterialProps>,
+  texRaster: { data: Uint8ClampedArray; size: number } | null,
+  K: number,
+  lloydIters: number,
+  normalWeight: number,
+): { patches: LocalPatch[]; localRadius: number } {
   const F = tris.count;
-  const K = nPatches;
 
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -405,10 +414,8 @@ export function sampleMeshPatches(
     if (sumA[k] > sumA[fallbackK]) fallbackK = k;
   }
 
-  const matProps = extractMaterialProps(mesh);
   // Optional per-patch albedo sampling from material.map texture (so textured .glb meshes bounce true local colors!)
-  const rawMat: any = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-  const texRaster = tris.u && tris.v ? rasterizeTextureMap(rawMat?.map) : null;
+  void mesh;
   let patchTexR: Float32Array | null = null;
   let patchTexG: Float32Array | null = null;
   let patchTexB: Float32Array | null = null;
@@ -461,12 +468,119 @@ export function sampleMeshPatches(
     });
   }
 
+  return { patches, localRadius: Math.max(0.5 * diag, 0.15) };
+}
+
+/**
+ * Deterministically cluster any Three.js Mesh into a single fixed patch count (default 32).
+ */
+export function sampleMeshPatches(
+  mesh: THREE.Mesh,
+  objectId: number,
+  nPatches: PatchLOD = PATCHES_PER_OBJECT as PatchLOD,
+  lloydIters: number = 6,
+  normalWeight: number = 0.45,
+): LocalObjectTokens {
+  const tris = extractLocalTriangles(mesh.geometry);
+  const matProps = extractMaterialProps(mesh);
+  const rawMat: any = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  const texRaster = tris.u && tris.v ? rasterizeTextureMap(rawMat?.map) : null;
+  const { patches, localRadius } = clusterTrianglesToPatches(
+    tris, mesh, matProps, texRaster, nPatches, lloydIters, normalWeight,
+  );
   return {
     objectId,
     mesh,
     patches,
+    lods: { [nPatches]: patches },
+    activeLod: nPatches,
+    patchStart: objectId * nPatches,
+    localRadius,
     ...matProps,
   };
+}
+
+/**
+ * Precompute the full Distance-LOD patch pyramid (4, 8, 16, 32, 64) ONCE per mesh in local space
+ * so switching LODs while orbiting the camera takes 0 ms with zero geometry re-clustering!
+ */
+export function sampleMeshMultiLOD(
+  mesh: THREE.Mesh,
+  objectId: number,
+  lloydIters: number = 5,
+  normalWeight: number = 0.45,
+): LocalObjectTokens {
+  const tris = extractLocalTriangles(mesh.geometry);
+  const matProps = extractMaterialProps(mesh);
+  const rawMat: any = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  const texRaster = tris.u && tris.v ? rasterizeTextureMap(rawMat?.map) : null;
+  const lods: Partial<Record<PatchLOD, LocalPatch[]>> = {};
+  let localRadius = 0.5;
+  for (const k of LOD_PATCH_COUNTS) {
+    const res = clusterTrianglesToPatches(tris, mesh, matProps, texRaster, k, lloydIters, normalWeight);
+    lods[k] = res.patches;
+    localRadius = res.localRadius;
+  }
+  const patches = lods[32]!;
+  return {
+    objectId,
+    mesh,
+    patches,
+    lods,
+    activeLod: 32,
+    patchStart: objectId * 32,
+    localRadius,
+    ...matProps,
+  };
+}
+
+const _lodCenter = new THREE.Vector3();
+const _lodScale = new THREE.Vector3();
+
+/**
+ * Select distance/screen-coverage Patch LOD (4, 8, 16, 32, 64) with 15% hysteresis band
+ * so objects never flicker between LODs as the user orbits the camera.
+ */
+export function selectObjectLOD(
+  obj: LocalObjectTokens,
+  camera: THREE.Camera,
+  mode: LODMode,
+  isEmitter = false,
+): PatchLOD {
+  if (mode === 'fixed32') return 32;
+
+  obj.mesh.updateWorldMatrix(true, false);
+  _lodCenter.setFromMatrixPosition(obj.mesh.matrixWorld);
+  _lodScale.setFromMatrixScale(obj.mesh.matrixWorld);
+  const maxS = Math.max(Math.abs(_lodScale.x), Math.abs(_lodScale.y), Math.abs(_lodScale.z), 1e-4);
+  const worldRad = obj.localRadius * maxS;
+  const dist = Math.max(_lodCenter.distanceTo(camera.position), 0.35);
+  const cov = worldRad / dist;
+
+  const prev = obj.activeLod;
+  if (mode === 'hero') {
+    if (isEmitter) return cov >= 0.25 ? 32 : 16;
+    if (cov >= (prev === 64 ? 0.42 : 0.50)) return 64;
+    if (cov >= (prev >= 32 ? 0.18 : 0.22)) return 32;
+    return 16;
+  }
+  if (mode === 'eco') {
+    if (isEmitter) return cov >= 0.22 ? 16 : 8;
+    if (cov >= (prev >= 16 ? 0.30 : 0.36)) return 16;
+    if (cov >= (prev >= 8 ? 0.14 : 0.18)) return 8;
+    return 4;
+  }
+  // mode === 'auto': Distance-adaptive LOD (64 very close hero -> 32 near -> 16 mid -> 8 far -> 4 distant)
+  if (isEmitter) {
+    if (cov >= (prev >= 32 ? 0.28 : 0.34)) return 32;
+    if (cov >= (prev >= 16 ? 0.13 : 0.16)) return 16;
+    return 8;
+  }
+  if (cov >= (prev === 64 ? 0.82 : 0.96)) return 64;
+  if (cov >= (prev >= 32 ? 0.36 : 0.43)) return 32;
+  if (cov >= (prev >= 16 ? 0.19 : 0.23)) return 16;
+  if (cov >= (prev >= 8 ? 0.095 : 0.115)) return 8;
+  return 4;
 }
 
 const _tmpPos = new THREE.Vector3();
@@ -501,8 +615,9 @@ export function writeWorldTokens(
   const metal = obj.materialOverride?.metallic ?? matLive.metallic;
   const emit = obj.materialOverride?.emission ?? matLive.emission;
 
-  for (let i = 0; i < obj.patches.length; i++) {
-    const p = obj.patches[i];
+  const activePatches = obj.lods?.[obj.activeLod] ?? obj.patches;
+  for (let i = 0; i < activePatches.length; i++) {
+    const p = activePatches[i];
     _tmpPos.set(p.px, p.py, p.pz).applyMatrix4(mw);
 
     // Transform normal by inverse-transpose (exact for both rigid & non-uniform scale)

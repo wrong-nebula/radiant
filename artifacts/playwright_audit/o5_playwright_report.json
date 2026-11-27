@@ -14,38 +14,60 @@
   "external_requests": [],
   "all_renders_non_blank": true,
   "pixel_diffs_viewport": {
-    "cornell_gi_vs_direct_l1": 38.77,
-    "cornell_live_bleed_shift_l1": 45.217,
-    "lcorridor_open_vs_occluded_l1": 15.287
+    "cornell_gi_vs_direct_l1": 40.077,
+    "cornell_live_bleed_shift_l1": 45.337,
+    "lcorridor_open_vs_occluded_l1": 21.49,
+    "cornell_sat0_vs_sat180_l1": 10.186
   },
   "gpu_indirect_rgb_checks": {
     "knot_before_rgb": [
-      0.2008,
-      0.2072,
-      0.0979
+      0.1994,
+      0.2076,
+      0.1003
     ],
     "knot_after_shift_rgb": [
-      0.2049,
-      0.1493,
-      0.1592
+      0.2151,
+      0.1472,
+      0.1638
     ],
-    "knot_chroma_shift_l2": 0.1664,
+    "knot_chroma_shift_l2": 0.1731,
+    "knot_1bounce_rgb": [
+      0.1063,
+      0.1094,
+      0.0617
+    ],
+    "knot_2bounce_rgb": [
+      0.1659,
+      0.1718,
+      0.0883
+    ],
+    "knot_3bounce_rgb": [
+      0.1994,
+      0.2076,
+      0.1003
+    ],
     "east_sculpt_open_rgb": [
-      0.0726,
-      0.0418,
-      0.023
+      0.0811,
+      0.0471,
+      0.0248
     ],
     "east_sculpt_occluded_rgb": [
-      0.0257,
-      0.0133,
-      0.0065
+      0.0046,
+      0.0023,
+      0.0009
     ],
-    "corridor_occlusion_drop_ratio": 0.6683
+    "corridor_occlusion_drop_ratio": 0.9491
   },
   "performance_m1": {
-    "steady_fps": 60.3,
-    "live_drag_fps": 63,
-    "mean_gi_compute_ms": 17.58,
+    "steady_fps": 60.7,
+    "live_drag_fps": 62.7,
+    "mean_gi_compute_ms": 12.47,
+    "n_tokens": 240
+  },
+  "performance_m1_fixed32": {
+    "steady_fps": 60.7,
+    "live_drag_fps": 60.5,
+    "mean_gi_compute_ms": 16.83,
     "n_tokens": 352
   },
   "screenshots": {
@@ -55,6 +77,8 @@
     "04_cornell_indirect_only": "artifacts/playwright_audit/04_cornell_indirect_only.png",
     "05_cornell_xray_probes": "artifacts/playwright_audit/05_cornell_xray_probes.png",
     "06_cornell_color_bleed_shift": "artifacts/playwright_audit/06_cornell_color_bleed_shift.png",
+    "14_cornell_sat0_mono": "artifacts/playwright_audit/14_cornell_sat0_mono.png",
+    "15_cornell_sat180_vivid": "artifacts/playwright_audit/15_cornell_sat180_vivid.png",
     "07_vaulted_gallery": "artifacts/playwright_audit/07_vaulted_gallery.png",
     "08_lcorridor_open": "artifacts/playwright_audit/08_lcorridor_open.png",
     "09_lcorridor_occluded": "artifacts/playwright_audit/09_lcorridor_occluded.png",
@@ -71,14 +95,14 @@
         3
       ],
       "mean_rgb": [
-        132.95,
-        143.58,
-        101.79
+        132.56,
+        144.38,
+        103.06
       ],
       "std_rgb": [
-        72.84,
-        77.35,
-        70.78
+        73.28,
+        77.19,
+        70.86
       ],
       "non_blank": true
     },
@@ -89,14 +113,14 @@
         3
       ],
       "mean_rgb": [
-        96.33,
-        112.61,
-        78.52
+        94.96,
+        112.0,
+        78.76
       ],
       "std_rgb": [
-        73.42,
-        74.29,
-        66.69
+        73.79,
+        74.65,
+        66.93
       ],
       "non_blank": true
     },
@@ -107,13 +131,13 @@
         3
       ],
       "mean_rgb": [
-        116.55,
-        133.27,
-        92.21
+        116.74,
+        133.94,
+        93.17
       ],
       "std_rgb": [
-        69.18,
-        76.42,
+        69.22,
+        76.62,
         66.27
       ],
       "non_blank": true
@@ -125,14 +149,14 @@
         3
       ],
       "mean_rgb": [
-        149.05,
-        140.83,
-        113.98
+        151.79,
+        142.93,
+        119.58
       ],
       "std_rgb": [
-        56.61,
-        54.67,
-        49.33
+        59.8,
+        56.51,
+        50.87
       ],
       "non_blank": true
     },
@@ -143,14 +167,14 @@
         3
       ],
       "mean_rgb": [
-        134.21,
-        145.39,
-        103.79
+        133.68,
+        145.92,
+        104.74
       ],
       "std_rgb": [
-        72.7,
-        76.22,
-        70.9
+        73.17,
+        76.15,
+        70.97
       ],
       "non_blank": true
     },
@@ -161,14 +185,50 @@
         3
       ],
       "mean_rgb": [
-        114.13,
-        101.96,
-        131.52
+        115.23,
+        103.0,
+        132.47
       ],
       "std_rgb": [
-        91.4,
-        77.58,
-        74.95
+        91.82,
+        76.87,
+        74.57
+      ],
+      "non_blank": true
+    },
+    "14_cornell_sat0_mono": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        129.55,
+        144.68,
+        110.65
+      ],
+      "std_rgb": [
+        72.03,
+        77.3,
+        73.86
+      ],
+      "non_blank": true
+    },
+    "15_cornell_sat180_vivid": {
+      "shape": [
+        760,
+        1280,
+        3
+      ],
+      "mean_rgb": [
+        134.57,
+        144.09,
+        95.17
+      ],
+      "std_rgb": [
+        74.57,
+        77.26,
+        68.83
       ],
       "non_blank": true
     },
@@ -179,14 +239,14 @@
         3
       ],
       "mean_rgb": [
-        128.81,
-        130.08,
-        134.24
+        132.21,
+        132.79,
+        136.73
       ],
       "std_rgb": [
-        62.01,
-        62.56,
-        61.88
+        62.72,
+        63.16,
+        62.75
       ],
       "non_blank": true
     },
@@ -197,14 +257,14 @@
         3
       ],
       "mean_rgb": [
-        93.89,
-        78.57,
-        63.63
+        95.21,
+        80.34,
+        65.03
       ],
       "std_rgb": [
-        73.66,
-        67.95,
-        62.94
+        72.57,
+        67.11,
+        62.46
       ],
       "non_blank": true
     },
@@ -215,14 +275,14 @@
         3
       ],
       "mean_rgb": [
-        82.53,
-        67.67,
-        54.12
+        76.25,
+        64.4,
+        52.77
       ],
       "std_rgb": [
-        74.24,
-        68.44,
-        63.24
+        76.96,
+        70.52,
+        64.66
       ],
       "non_blank": true
     },
@@ -233,14 +293,14 @@
         3
       ],
       "mean_rgb": [
-        112.35,
-        108.41,
-        110.38
+        109.91,
+        105.88,
+        108.01
       ],
       "std_rgb": [
-        83.37,
-        81.31,
-        78.02
+        83.88,
+        81.65,
+        78.56
       ],
       "non_blank": true
     },
@@ -251,14 +311,14 @@
         3
       ],
       "mean_rgb": [
-        161.22,
-        137.42,
-        104.48
+        159.57,
+        135.51,
+        103.2
       ],
       "std_rgb": [
-        69.01,
-        68.26,
-        63.66
+        70.45,
+        69.58,
+        64.39
       ],
       "non_blank": true
     },
@@ -269,14 +329,14 @@
         3
       ],
       "mean_rgb": [
-        162.68,
-        138.35,
-        104.91
+        158.43,
+        134.31,
+        102.59
       ],
       "std_rgb": [
-        68.03,
-        68.57,
-        64.05
+        70.48,
+        69.54,
+        64.33
       ],
       "non_blank": true
     },
@@ -287,14 +347,14 @@
         3
       ],
       "mean_rgb": [
-        91.98,
-        145.99,
-        167.56
+        92.34,
+        145.65,
+        165.94
       ],
       "std_rgb": [
-        36.33,
-        51.29,
-        53.68
+        37.35,
+        52.66,
+        55.54
       ],
       "non_blank": true
     }

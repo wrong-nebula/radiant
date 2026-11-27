@@ -13,6 +13,7 @@ import numpy as np
 from radiant.sh_math import build_frisvad_basis_np
 
 PATCHES_PER_OBJECT = 32
+LOD_PATCH_COUNTS: tuple[int, ...] = (4, 8, 16, 32, 64)
 
 
 @dataclass
@@ -195,7 +196,7 @@ def cluster_mesh_patches(
 
 
 def build_local_template(name: str, verts: np.ndarray, faces: np.ndarray, n_patches: int = PATCHES_PER_OBJECT) -> LocalMeshTemplate:
-    """Subdivide if needed and pre-compute deterministic 32-patch clustering + CSR tables once."""
+    """Subdivide if needed and pre-compute deterministic patch clustering + CSR tables once."""
     v, f = subdivide_mesh_to_min_faces(verts, faces, min_faces=max(128, n_patches * 4))
     tri_pid = cluster_mesh_patches(v, f, n_patches=n_patches)
     pdict, fn, _ = extract_patches_from_mesh(
@@ -218,6 +219,41 @@ def build_local_template(name: str, verts: np.ndarray, faces: np.ndarray, n_patc
         tri_indices=pdict["tri_indices"],
         tri_cdf=pdict["tri_cdf"],
     )
+
+
+def build_multi_lod_templates(
+    name: str,
+    verts: np.ndarray,
+    faces: np.ndarray,
+    lod_counts: tuple[int, ...] = LOD_PATCH_COUNTS,
+) -> dict[int, LocalMeshTemplate]:
+    """Pre-cluster one mesh archetype across all Distance-LOD patch levels (4, 8, 16, 32, 64) on identical geometry."""
+    max_k = max(lod_counts)
+    v, f = subdivide_mesh_to_min_faces(verts, faces, min_faces=max(256, max_k * 4))
+    out: dict[int, LocalMeshTemplate] = {}
+    for k in lod_counts:
+        tri_pid = cluster_mesh_patches(v, f, n_patches=k)
+        pdict, fn, _ = extract_patches_from_mesh(
+            v, f, tri_pid, k,
+            albedo=(0.5, 0.5, 0.5), roughness=0.8, metallic=0.0, emission=(0.0, 0.0, 0.0),
+            object_id=0, face_offset=0,
+        )
+        out[k] = LocalMeshTemplate(
+            name=name,
+            verts=v,
+            faces=f,
+            tri_patch_id=tri_pid,
+            n_patches=k,
+            local_face_normals=fn,
+            local_patch_pos=pdict["pos"],
+            local_patch_N=pdict["N"],
+            local_patch_area=pdict["area"],
+            tri_offsets=pdict["tri_offsets"],
+            tri_counts=pdict["tri_counts"],
+            tri_indices=pdict["tri_indices"],
+            tri_cdf=pdict["tri_cdf"],
+        )
+    return out
 
 
 def fast_transform_template_patches(

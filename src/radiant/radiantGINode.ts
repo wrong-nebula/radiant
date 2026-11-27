@@ -54,12 +54,20 @@ import {
 export function createRadiantGIUniforms() {
   return {
     giIntensity: uniform(1.0, 'float'),
+    giSaturation: uniform(1.0, 'float'),
     viewMode: uniform(0.0, 'float'),
     splitX: uniform(0.5, 'float'),
   };
 }
 
 export type RadiantGIUniforms = ReturnType<typeof createRadiantGIUniforms>;
+
+export interface RadiantGIObjectHandle {
+  objRow: any;
+  patchStart: any;
+  patchCount: any;
+  baseAlbedoScalar: any;
+}
 
 /**
  * Evaluate bilateral normal-gated Order-1 SH indirect irradiance (diffuse + directional glossy)
@@ -81,9 +89,11 @@ export function buildRadiantGINode(
         MAX_RENDER_PATCHES * WORLD_PATCH_VEC4S,
       ).toReadOnly();
   const patchTex = engine.worldPatchTexture;
-  // Use uniforms (not compile-time constants!) so all objects in a room share ONE compiled shader program!
+  // Use uniforms (not compile-time constants!) so all objects in a room share ONE compiled shader program
+  // AND live Distance Patch LOD (4..64 patches/object) switches in 0.001 ms with ZERO shader recompile!
   const objRow = uniform(objectId, 'int');
   const patchStart = uniform(objectId * PATCHES_PER_OBJECT, 'int');
+  const patchCount = uniform(PATCHES_PER_OBJECT, 'int');
   const roughF = uniform(Math.min(1.0, Math.max(0.08, roughnessVal)), 'float');
   const metalF = uniform(Math.min(1.0, Math.max(0.0, metalnessVal)), 'float');
 
@@ -106,7 +116,7 @@ export function buildRadiantGINode(
     const specExp = mix(float(18.0), float(2.0), roughF.mul(roughF));
     const specNorm = specExp.add(2.0).div(6.2831853);
 
-    Loop(PATCHES_PER_OBJECT, ({ i }) => {
+    Loop(patchCount, ({ i }) => {
       let p0: any, p1: any, p2: any, p3: any, p4: any, p5: any;
       if (useTextureFallback) {
         const colBase = i.mul(WORLD_PATCH_VEC4S);
@@ -204,12 +214,12 @@ export function buildRadiantGINode(
     return mix(ab, c, clamp(t.mul(3.0).sub(1.99).mul(100.0), 0.0, 1.0));
   });
 
-  return { evalBilateralSH, heatmapColor, sharedUniforms };
+  return { evalBilateralSH, heatmapColor, sharedUniforms, objRow, patchStart, patchCount };
 }
 
 /**
  * Drop-in helper: attach real-time zero-bake RADIANT-GI indirect bounce lighting
- * (diffuse + directional glossy specular + per-pixel texture albedo) to any Three.js
+ * (diffuse + directional glossy specular + bounce saturation + live Distance Patch LOD) to any Three.js
  * `MeshStandardNodeMaterial` or `MeshPhysicalNodeMaterial`.
  */
 export function applyRadiantGI(
@@ -217,17 +227,19 @@ export function applyRadiantGI(
   engine: RadiantComputeEngine,
   objectId: number,
   sharedUniforms: RadiantGIUniforms,
-  options?: { isEmitter?: boolean },
+  options?: { isEmitter?: boolean; patchStart?: number; patchCount?: number },
 ): THREE.MeshStandardNodeMaterial | THREE.MeshPhysicalNodeMaterial {
   const roughVal = typeof material.roughness === 'number' ? material.roughness : 0.8;
   const metalVal = typeof material.metalness === 'number' ? material.metalness : 0.0;
-  const { evalBilateralSH, heatmapColor } = buildRadiantGINode(
+  const { evalBilateralSH, heatmapColor, objRow, patchStart, patchCount } = buildRadiantGINode(
     engine,
     objectId,
     sharedUniforms,
     roughVal,
     metalVal,
   );
+  if (options?.patchStart !== undefined) patchStart.value = options.patchStart;
+  if (options?.patchCount !== undefined) patchCount.value = options.patchCount;
   const isEmitter = options?.isEmitter ?? false;
 
   const baseColor = material.color.clone();
@@ -246,8 +258,15 @@ export function applyRadiantGI(
 
   const giContribution = Fn(() => {
     const sh = evalBilateralSH();
-    const indirectDiff = sh.diffIrr.mul(sharedUniforms.giIntensity);
-    const indirectSpec = sh.specIrr.mul(sharedUniforms.giIntensity);
+    // Luminance-preserving indirect bounce color saturation (0 = neutral monochrome, 1 = physical, 2 = hyper-vivid)
+    const lumaW = vec3(0.2126, 0.7152, 0.0722);
+    const diffY = dot(sh.diffIrr, lumaW);
+    const specY = dot(sh.specIrr, lumaW);
+    const satDiff = max(mix(vec3(diffY, diffY, diffY), sh.diffIrr, sharedUniforms.giSaturation), vec3(0.0, 0.0, 0.0));
+    const satSpec = max(mix(vec3(specY, specY, specY), sh.specIrr, sharedUniforms.giSaturation), vec3(0.0, 0.0, 0.0));
+
+    const indirectDiff = satDiff.mul(sharedUniforms.giIntensity);
+    const indirectSpec = satSpec.mul(sharedUniforms.giIntensity);
     const errVal = sh.err;
 
     // Support per-pixel diffuse texture maps on dropped-in .glb assets!
@@ -289,6 +308,12 @@ export function applyRadiantGI(
   });
 
   material.emissiveNode = giContribution();
+  material.userData.radiantGI = {
+    objRow,
+    patchStart,
+    patchCount,
+    baseAlbedoScalar,
+  } as RadiantGIObjectHandle;
   material.needsUpdate = true;
   return material;
 }

@@ -125,8 +125,12 @@ def export_rdg8(fp16_bin: Path, out_bin: Path) -> tuple[dict, torch.nn.Module]:
     q8_u32_len = len(q8_bytes) // 4
     f32_len = len(f32_bytes) // 4
 
+    feature_flags = (
+        (1 if getattr(model, "area_prior", False) else 0)
+        | (2 if getattr(model, "multi_bounce", False) else 0)
+    )
     header = struct.pack(
-        "<4s7If28s",
+        "<4s7IfI24s",
         b"RDG8",
         2,
         model.d_model,
@@ -136,7 +140,8 @@ def export_rdg8(fp16_bin: Path, out_bin: Path) -> tuple[dict, torch.nn.Module]:
         q8_u32_len,
         f32_len,
         float(POS_SCALE_METERS),
-        b"\x00" * 28,
+        feature_flags,
+        b"\x00" * 24,
     )
     assert len(header) == 64
 
@@ -196,7 +201,16 @@ def main() -> None:
     }
     res_aligned = evaluate_model_on_heldout(q8_model, heldout, torch.device("cpu"), random_se3=False, batch_size=16, use_bf16=False)
     res_occ = evaluate_dynamic_occlusion(q8_model, occ, torch.device("cpu"))
-    print(f"[quantize_q8] O3 Held-Out 256 (INT8): {res_aligned}", flush=True)
+    print(f"[quantize_q8] O3 Held-Out 256 Uniform-32 (INT8): {res_aligned}", flush=True)
+    if "lod_tokens_fp16" in npz:
+        lod_heldout = {
+            "tokens_fp16": npz["lod_tokens_fp16"],
+            "targets_fp16": npz["lod_targets_fp16"],
+            "object_ids": npz["lod_object_ids"],
+            "scene_offsets": npz["lod_scene_offsets"],
+        }
+        res_lod = evaluate_model_on_heldout(q8_model, lod_heldout, torch.device("cpu"), random_se3=False, batch_size=16, use_bf16=False)
+        print(f"[quantize_q8] O3 Held-Out Mixed-LOD (INT8): {res_lod}", flush=True)
     print(f"[quantize_q8] O3 Occlusion 16 (INT8): gt={res_occ['mean_gt_drop_ratio']:.4f}, pred={res_occ['mean_pred_drop_ratio']:.4f}", flush=True)
     print(f"[quantize_q8] Worst Q8-vs-FP16 probe RMSE: {worst_vs_fp16:.6f}", flush=True)
 

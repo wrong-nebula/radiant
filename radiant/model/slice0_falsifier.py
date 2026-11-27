@@ -81,14 +81,16 @@ def apply_tangent_twist_augmentation(
     tok_out[..., 3:6] = T_new.to(tokens.dtype)
     tok_out[..., 6:9] = B_new.to(tokens.dtype)
 
-    it = targets[..., 3:6].float()
-    ib = targets[..., 6:9].float()
-    it_new = c * it + s * ib
-    ib_new = -s * it + c * ib
-
     tgt_out = targets.clone()
-    tgt_out[..., 3:6] = it_new.to(targets.dtype)
-    tgt_out[..., 6:9] = ib_new.to(targets.dtype)
+    n_blocks = targets.shape[-1] // 12
+    for bi in range(n_blocks):
+        base = bi * 12
+        it = targets[..., base + 3 : base + 6].float()
+        ib = targets[..., base + 6 : base + 9].float()
+        it_new = c * it + s * ib
+        ib_new = -s * it + c * ib
+        tgt_out[..., base + 3 : base + 6] = it_new.to(targets.dtype)
+        tgt_out[..., base + 6 : base + 9] = ib_new.to(targets.dtype)
     return tok_out, tgt_out
 
 
@@ -96,18 +98,21 @@ def collate_csr_scenes(
     dataset: dict[str, np.ndarray],
     indices: np.ndarray,
     device: torch.device,
+    *,
+    use_bounces: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Slice variable-length scenes from CSR RAM arrays into padded GPU tensors."""
     offsets = dataset["scene_offsets"]
     tok_all = dataset["tokens_fp16"]
-    tgt_all = dataset["targets_fp16"]
+    tgt_all = dataset["bounces_fp16"] if (use_bounces and "bounces_fp16" in dataset) else dataset["targets_fp16"]
+    tgt_dim = int(tgt_all.shape[-1])
 
     lengths = [int(offsets[i + 1] - offsets[i]) for i in indices]
     max_len = max(lengths)
     B = len(indices)
 
     tok_batch = np.zeros((B, max_len, 21), dtype=np.float32)
-    tgt_batch = np.zeros((B, max_len, 12), dtype=np.float32)
+    tgt_batch = np.zeros((B, max_len, tgt_dim), dtype=np.float32)
     mask_batch = np.zeros((B, max_len), dtype=bool)
 
     for b, idx in enumerate(indices):

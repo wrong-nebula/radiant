@@ -75,12 +75,34 @@
             <input id="gi-gain-slider" type="range" min="0.0" max="2.5" step="0.05" value="1.15" />
             <span id="gi-gain-val">1.15×</span>
           </div>
+          <div class="slider-row">
+            <span>Bounce Saturation</span>
+            <input id="gi-sat-slider" type="range" min="0.0" max="2.0" step="0.05" value="1.00" />
+            <span id="gi-sat-val">100%</span>
+          </div>
+          <div class="sub-control-row">
+            <span class="sub-label">Bounce Depth</span>
+            <div class="btn-grid-3" id="bounce-buttons">
+              <button data-bounces="1">1 Bounce</button>
+              <button data-bounces="2">2 Bounce</button>
+              <button data-bounces="3" class="active">3 Bounce</button>
+            </div>
+          </div>
+          <div class="sub-control-row">
+            <span class="sub-label">Distance Patch LOD</span>
+            <div class="btn-grid-4" id="lod-buttons">
+              <button data-lod="auto" class="active">Auto</button>
+              <button data-lod="hero">Hero 64</button>
+              <button data-lod="fixed32">Fixed 32</button>
+              <button data-lod="eco">Eco</button>
+            </div>
+          </div>
         </section>
 
         <section class="panel-group">
           <label class="group-title">Scientific X-Ray Overlays</label>
           <div class="toggle-row">
-            <label><input type="checkbox" id="chk-patches" /> 32-Patch Token Spheres</label>
+            <label><input type="checkbox" id="chk-patches" /> Distance-LOD Patch Spheres</label>
             <label><input type="checkbox" id="chk-sh-probes" /> SH Directional Probes</label>
           </div>
         </section>

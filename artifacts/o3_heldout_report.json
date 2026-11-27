@@ -1,29 +1,56 @@
 {
   "gate": "O3_HELDOUT_MULTIBOUNCE_GI_FIDELITY",
   "passed": true,
+  "area_prior": true,
+  "multi_bounce": true,
+  "lod_levels": [
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
   "n_heldout_scenes": 256,
+  "n_heldout_lod_scenes": 128,
   "aligned_metrics": {
-    "psnr_db": 30.7122,
-    "color_bleed_r": 0.9954,
-    "sh_dir_cosine": 0.98643,
-    "sh_rmse": 0.104883
+    "psnr_db": 31.2328,
+    "color_bleed_r": 0.99598,
+    "sh_dir_cosine": 0.98751,
+    "sh_rmse": 0.090709
   },
   "rotated_metrics": {
-    "psnr_db": 30.7109,
-    "color_bleed_r": 0.9954,
-    "sh_dir_cosine": 0.98643,
-    "sh_rmse": 0.104889
+    "psnr_db": 31.2336,
+    "color_bleed_r": 0.99598,
+    "sh_dir_cosine": 0.98751,
+    "sh_rmse": 0.090689
+  },
+  "mixed_lod_aligned_metrics": {
+    "psnr_db": 32.1254,
+    "color_bleed_r": 0.99686,
+    "sh_dir_cosine": 0.98809,
+    "sh_rmse": 0.063397
+  },
+  "mixed_lod_rotated_metrics": {
+    "psnr_db": 32.1273,
+    "color_bleed_r": 0.99686,
+    "sh_dir_cosine": 0.98809,
+    "sh_rmse": 0.063246
+  },
+  "per_bounce_psnr_db": {
+    "1_bounce_psnr_db": 30.061,
+    "2_bounce_psnr_db": 31.005,
+    "3_bounce_psnr_db": 31.233
   },
   "se3_invariance_drift": {
-    "mean_se3_rmse": 0.00021,
-    "max_se3_rmse": 0.0002404,
-    "max_abs_diff": 0.02005
+    "mean_se3_rmse": 0.0002201,
+    "max_se3_rmse": 0.0003527,
+    "max_abs_diff": 0.063839
   },
   "dynamic_occlusion": {
     "n_pairs": 16,
     "mean_gt_drop_ratio": 0.955,
-    "mean_pred_drop_ratio": 0.9631,
-    "mean_drop_abs_error": 0.0109,
+    "mean_pred_drop_ratio": 0.984,
+    "mean_drop_abs_error": 0.029,
     "passed_drop_ge_40pct": true,
     "sample_pairs": [
       {
@@ -31,75 +58,75 @@
         "gt_open": 0.2591,
         "gt_occ": 0.0138,
         "gt_drop_pct": 94.69,
-        "pred_open": 0.2574,
-        "pred_occ": 0.0104,
-        "pred_drop_pct": 95.96
+        "pred_open": 0.2476,
+        "pred_occ": 0.0043,
+        "pred_drop_pct": 98.28
       },
       {
         "pair": 1,
         "gt_open": 0.1965,
         "gt_occ": 0.0095,
         "gt_drop_pct": 95.17,
-        "pred_open": 0.1875,
-        "pred_occ": 0.005,
-        "pred_drop_pct": 97.32
+        "pred_open": 0.182,
+        "pred_occ": 0.0032,
+        "pred_drop_pct": 98.26
       },
       {
         "pair": 2,
         "gt_open": 0.1053,
         "gt_occ": 0.0052,
         "gt_drop_pct": 95.11,
-        "pred_open": 0.1169,
-        "pred_occ": 0.0029,
-        "pred_drop_pct": 97.48
+        "pred_open": 0.1118,
+        "pred_occ": 0.0027,
+        "pred_drop_pct": 97.61
       },
       {
         "pair": 3,
         "gt_open": 0.2461,
         "gt_occ": 0.0132,
         "gt_drop_pct": 94.62,
-        "pred_open": 0.2433,
-        "pred_occ": 0.0157,
-        "pred_drop_pct": 93.56
+        "pred_open": 0.2355,
+        "pred_occ": 0.0066,
+        "pred_drop_pct": 97.18
       }
     ]
   },
   "per_topology_breakdown": {
     "unseen_cornell_sculptural": {
       "n_scenes": 67,
-      "psnr_db": 31.272,
-      "color_bleed_r": 0.9957,
-      "sh_dir_cosine": 0.9895
+      "psnr_db": 32.118,
+      "color_bleed_r": 0.9965,
+      "sh_dir_cosine": 0.9903
     },
     "unseen_diagonal_gallery": {
       "n_scenes": 74,
-      "psnr_db": 29.93,
-      "color_bleed_r": 0.9931,
-      "sh_dir_cosine": 0.9814
+      "psnr_db": 30.682,
+      "color_bleed_r": 0.9943,
+      "sh_dir_cosine": 0.9828
     },
     "unseen_split_doorway": {
       "n_scenes": 48,
-      "psnr_db": 29.832,
-      "color_bleed_r": 0.9932,
-      "sh_dir_cosine": 0.9812
+      "psnr_db": 30.476,
+      "color_bleed_r": 0.9942,
+      "sh_dir_cosine": 0.9827
     },
     "unseen_vaulted_atrium": {
       "n_scenes": 67,
-      "psnr_db": 32.109,
-      "color_bleed_r": 0.9973,
-      "sh_dir_cosine": 0.9923
+      "psnr_db": 31.833,
+      "color_bleed_r": 0.9972,
+      "sh_dir_cosine": 0.993
     }
   },
   "export_info": {
     "path": "/content/radiant_out/radiant_gi_fp16.bin",
-    "size_bytes": 13817400,
-    "size_mb": 13.177,
+    "size_bytes": 13829736,
+    "size_mb": 13.189,
     "n_tensors": 171,
-    "total_params": 6908668
+    "total_params": 6914836
   },
   "probe_info": {
     "path": "/content/radiant_out/parity_probes.json",
-    "n_probes": 4,
-    "size_mb": 1.266
+    "n_probes": 6,
+    "size_mb": 1.867
   }
 }

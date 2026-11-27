@@ -1,6 +1,6 @@
 {
-  "gpu_name": "NVIDIA L4",
-  "vram_gb": 22.03,
+  "gpu_name": "NVIDIA A100-SXM4-40GB",
+  "vram_gb": 39.49,
   "bf16_supported": true,
   "torch_version": "2.14.1+cu130",
   "warp_version": "1.19.0",

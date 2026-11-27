@@ -135,7 +135,31 @@ html, body, #app {
   gap: 5px;
 }
 
-.btn-grid button, .mini {
+.btn-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+
+.btn-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+
+.sub-control-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.sub-label {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.btn-grid button, .btn-grid-3 button, .btn-grid-4 button, .mini {
   background: rgba(255, 255, 255, 0.05);
   color: var(--text);
   border: 1px solid var(--border);
@@ -148,11 +172,17 @@ html, body, #app {
   text-align: left;
 }
 
-.btn-grid button:hover, .mini:hover {
+.btn-grid-3 button, .btn-grid-4 button {
+  padding: 5px 4px;
+  font-size: 10px;
+  text-align: center;
+}
+
+.btn-grid button:hover, .btn-grid-3 button:hover, .btn-grid-4 button:hover, .mini:hover {
   background: rgba(255, 255, 255, 0.11);
 }
 
-.btn-grid button.active, .mini.active {
+.btn-grid button.active, .btn-grid-3 button.active, .btn-grid-4 button.active, .mini.active {
   background: var(--accent-bg);
   border-color: var(--accent);
   color: #ffffff;

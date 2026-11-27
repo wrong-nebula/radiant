@@ -60,12 +60,13 @@ export function unpackRDG8ToCanonicalF32(
   const f32Aux = new Float32Array(buffer, 64 + q8U32Len * 4, f32Len);
 
   // Allocate canonical float array matching RDGI layout
+  const head2OutDim = header.isMultiBounce ? 36 : 12;
   let totalElems = dModel * 13 + dModel + dModel * dModel + dModel;
   const qkvRows = nHeads * 78;
   totalElems +=
     nLayers *
     (dModel + qkvRows * dModel + qkvRows + dModel * dModel + dModel + dModel + dFF * dModel + dFF + dModel * dFF + dModel);
-  totalElems += dModel + dModel * dModel + dModel + 12 * dModel + 12;
+  totalElems += dModel + dModel * dModel + dModel + head2OutDim * dModel + head2OutDim;
 
   const out = new Float32Array(totalElems);
   let outPos = 0;
@@ -157,8 +158,8 @@ export function unpackRDG8ToCanonicalF32(
 
   const finalNormW = copyAux(dModel);
   const head1 = deqMat(dModel, dModel);
-  const head2W = copyAux(12 * dModel);
-  const head2B = copyAux(12);
+  const head2W = copyAux(head2OutDim * dModel);
+  const head2B = copyAux(head2OutDim);
 
   return {
     weights: out,
@@ -373,6 +374,7 @@ export async function runRadiantCPU(
   cx *= invN; cy *= invN; cz *= invN;
 
   // 2. Geo [N, 16] and Intr [N, 13]
+  const useAreaPrior = Boolean(header.hasAreaPrior);
   const geo = new Float32Array(nTokens * 16);
   const intr = new Float32Array(nTokens * 13);
   for (let i = 0; i < nTokens; i++) {
@@ -380,13 +382,14 @@ export async function runRadiantCPU(
     const px = (tokens[tb] - cx) * invScale;
     const py = (tokens[tb + 1] - cy) * invScale;
     const pz = (tokens[tb + 2] - cz) * invScale;
+    const area = Math.max(tokens[tb + 12], 0.0);
     const gb = i * 16;
     geo[gb] = px; geo[gb + 1] = py; geo[gb + 2] = pz; geo[gb + 3] = px * px + py * py + pz * pz;
     geo[gb + 4] = tokens[tb + 3]; geo[gb + 5] = tokens[tb + 4]; geo[gb + 6] = tokens[tb + 5];
+    geo[gb + 7] = useAreaPrior ? Math.log(Math.max(area, 1e-4)) : 0.0;
     geo[gb + 8] = tokens[tb + 6]; geo[gb + 9] = tokens[tb + 7]; geo[gb + 10] = tokens[tb + 8];
     geo[gb + 12] = tokens[tb + 9]; geo[gb + 13] = tokens[tb + 10]; geo[gb + 14] = tokens[tb + 11];
 
-    const area = Math.max(tokens[tb + 12], 0.0);
     const ar = Math.max(0, Math.min(1, tokens[tb + 13]));
     const ag = Math.max(0, Math.min(1, tokens[tb + 14]));
     const ab = Math.max(0, Math.min(1, tokens[tb + 15]));
@@ -494,7 +497,7 @@ export async function runRadiantCPU(
         K[ob + 24] = 2.0 * beta * px + vx;
         K[ob + 25] = 2.0 * beta * py + vy;
         K[ob + 26] = 2.0 * beta * pz + vz;
-        K[ob + 27] = -beta * pn2 - (vx * px + vy * py + vz * pz);
+        K[ob + 27] = -beta * pn2 - (vx * px + vy * py + vz * pz) + geo[gb + 7];
         K[ob + 28] = -beta;
         K[ob + 29] = rx; K[ob + 30] = ry; K[ob + 31] = rz;
 
@@ -569,30 +572,54 @@ export async function runRadiantCPU(
     linearLayer(ffn, weights, L.fc2W * 2, L.fc2B * 2, xB, xA, nTokens, dFF, dModel, false);
   }
 
-  // 5. Final RMSNorm + Output Head + Physical SH Decode
+  // 5. Final RMSNorm + Output Head + Physical SH Decode (12-ch single OR 36-ch [b1, b2, b3] Neumann bounces)
+  const isMultiBounce = Boolean(header.isMultiBounce);
+  const head2OutDim = isMultiBounce ? 36 : SH_STRIDE;
   rmsNorm(xA, weights, layout.finalNormW * 2, xNorm, nTokens, dModel);
   linearLayer(xNorm, weights, layout.head1W * 2, layout.head1B * 2, null, xB, nTokens, dModel, dModel, true);
-  const raw = new Float32Array(nTokens * SH_STRIDE);
-  linearLayer(xB, weights, layout.head2W * 2, layout.head2B * 2, null, raw, nTokens, dModel, SH_STRIDE, false);
+  const raw = new Float32Array(nTokens * head2OutDim);
+  linearLayer(xB, weights, layout.head2W * 2, layout.head2B * 2, null, raw, nTokens, dModel, head2OutDim, false);
 
-  const shOut = new Float32Array(nTokens * SH_STRIDE);
+  const shOut = new Float32Array(nTokens * head2OutDim);
+  const nBlocks = isMultiBounce ? 3 : 1;
   for (let i = 0; i < nTokens; i++) {
-    const b = i * SH_STRIDE;
-    const i0r = softplusClamped(raw[b], 64.0);
-    const i0g = softplusClamped(raw[b + 1], 64.0);
-    const i0b = softplusClamped(raw[b + 2], 64.0);
-    shOut[b] = i0r;
-    shOut[b + 1] = i0g;
-    shOut[b + 2] = i0b;
-    shOut[b + 3] = i0r * Math.tanh(Math.max(-15, Math.min(15, raw[b + 3])));
-    shOut[b + 4] = i0g * Math.tanh(Math.max(-15, Math.min(15, raw[b + 4])));
-    shOut[b + 5] = i0b * Math.tanh(Math.max(-15, Math.min(15, raw[b + 5])));
-    shOut[b + 6] = i0r * Math.tanh(Math.max(-15, Math.min(15, raw[b + 6])));
-    shOut[b + 7] = i0g * Math.tanh(Math.max(-15, Math.min(15, raw[b + 7])));
-    shOut[b + 8] = i0b * Math.tanh(Math.max(-15, Math.min(15, raw[b + 8])));
-    shOut[b + 9] = i0r / (1.0 + Math.exp(-Math.max(-20, Math.min(20, raw[b + 9]))));
-    shOut[b + 10] = i0g / (1.0 + Math.exp(-Math.max(-20, Math.min(20, raw[b + 10]))));
-    shOut[b + 11] = i0b / (1.0 + Math.exp(-Math.max(-20, Math.min(20, raw[b + 11]))));
+    for (let blk = 0; blk < nBlocks; blk++) {
+      const b = i * head2OutDim + blk * SH_STRIDE;
+      const i0r = softplusClamped(raw[b], 64.0);
+      const i0g = softplusClamped(raw[b + 1], 64.0);
+      const i0b = softplusClamped(raw[b + 2], 64.0);
+      shOut[b] = i0r;
+      shOut[b + 1] = i0g;
+      shOut[b + 2] = i0b;
+      shOut[b + 3] = i0r * Math.tanh(Math.max(-15, Math.min(15, raw[b + 3])));
+      shOut[b + 4] = i0g * Math.tanh(Math.max(-15, Math.min(15, raw[b + 4])));
+      shOut[b + 5] = i0b * Math.tanh(Math.max(-15, Math.min(15, raw[b + 5])));
+      shOut[b + 6] = i0r * Math.tanh(Math.max(-15, Math.min(15, raw[b + 6])));
+      shOut[b + 7] = i0g * Math.tanh(Math.max(-15, Math.min(15, raw[b + 7])));
+      shOut[b + 8] = i0b * Math.tanh(Math.max(-15, Math.min(15, raw[b + 8])));
+      shOut[b + 9] = i0r / (1.0 + Math.exp(-Math.max(-20, Math.min(20, raw[b + 9]))));
+      shOut[b + 10] = i0g / (1.0 + Math.exp(-Math.max(-20, Math.min(20, raw[b + 10]))));
+      shOut[b + 11] = i0b / (1.0 + Math.exp(-Math.max(-20, Math.min(20, raw[b + 11]))));
+    }
   }
   return shOut;
+}
+
+/** Combine decoded [N, 36] per-bounce SH into [N, 12] for any bounceCount in [1, 3] (instant 0ms switch!). */
+export function combineBounceSH(decoded: Float32Array, nTokens: number, bounceCount: number, isMultiBounce: boolean): Float32Array {
+  if (!isMultiBounce) {
+    // Graceful fallback for legacy 3-bounce-only binaries: scale smoothly
+    return decoded;
+  }
+  const w2 = Math.max(0, Math.min(1, bounceCount - 1.0));
+  const w3 = Math.max(0, Math.min(1, bounceCount - 2.0));
+  const out = new Float32Array(nTokens * SH_STRIDE);
+  for (let i = 0; i < nTokens; i++) {
+    const src = i * 36;
+    const dst = i * 12;
+    for (let k = 0; k < 12; k++) {
+      out[dst + k] = decoded[src + k] + w2 * decoded[src + 12 + k] + w3 * decoded[src + 24 + k];
+    }
+  }
+  return out;
 }

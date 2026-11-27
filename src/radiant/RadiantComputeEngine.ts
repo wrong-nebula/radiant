@@ -15,7 +15,7 @@ import {
   SH_STRIDE,
   TOKEN_STRIDE,
 } from './shMath.ts';
-import { runRadiantCPU, unpackRDG8ToCanonicalF32, unpackRDGIWeightsF32 } from './cpuFallback.ts';
+import { combineBounceSH, runRadiantCPU, unpackRDG8ToCanonicalF32, unpackRDGIWeightsF32 } from './cpuFallback.ts';
 import {
   WGSL_BUILD_SE3_QKV_FUSED,
   WGSL_LINEAR_F32,
@@ -34,6 +34,14 @@ export interface RDGIHeader {
   nTensors: number;
   flags: number;
   posScale: number;
+  hasAreaPrior: boolean;
+  isMultiBounce: boolean;
+}
+
+export interface ObjectPatchRange {
+  objectId: number;
+  patchStart: number;
+  patchCount: number;
 }
 
 interface LayerOffsets {
@@ -141,7 +149,7 @@ const WGSL_PREP_GEO_INTR = /* wgsl */ `
 struct Params {
   n_tokens: u32,
   pos_scale: f32,
-  _pad1: u32,
+  area_prior: u32,
   _pad2: u32,
 };
 
@@ -162,17 +170,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let py = (tokens[tb + 1u] - centroid[1]) * inv_s;
   let pz = (tokens[tb + 2u] - centroid[2]) * inv_s;
   let pn2 = px * px + py * py + pz * pz;
+  let area = max(tokens[tb + 12u], 0.0);
+  let log_area_prior = select(0.0, log(max(area, 1e-4)), params.area_prior != 0u);
 
   let gb = i * 16u;
   geo[gb + 0u] = px;
   geo[gb + 1u] = py;
   geo[gb + 2u] = pz;
   geo[gb + 3u] = pn2;
-  // T
+  // T + Riemann Area-Prior log(A_j) in w
   geo[gb + 4u] = tokens[tb + 3u];
   geo[gb + 5u] = tokens[tb + 4u];
   geo[gb + 6u] = tokens[tb + 5u];
-  geo[gb + 7u] = 0.0;
+  geo[gb + 7u] = log_area_prior;
   // B
   geo[gb + 8u] = tokens[tb + 6u];
   geo[gb + 9u] = tokens[tb + 7u];
@@ -184,7 +194,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   geo[gb + 14u] = tokens[tb + 11u];
   geo[gb + 15u] = 0.0;
 
-  let area = max(tokens[tb + 12u], 0.0);
   let ar = clamp(tokens[tb + 13u], 0.0, 1.0);
   let ag = clamp(tokens[tb + 14u], 0.0, 1.0);
   let ab = clamp(tokens[tb + 15u], 0.0, 1.0);
@@ -492,7 +501,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   K_out[out_base + 24u] = k3.x;
   K_out[out_base + 25u] = k3.y;
   K_out[out_base + 26u] = k3.z;
-  K_out[out_base + 27u] = -beta * pn2 - dot(v_w, p);
+  K_out[out_base + 27u] = -beta * pn2 - dot(v_w, p) + geo[gb + 7u];
   K_out[out_base + 28u] = -beta;
   K_out[out_base + 29u] = r_w.x;
   K_out[out_base + 30u] = r_w.y;
@@ -688,8 +697,8 @@ fn main(
 const WGSL_DECODE_SH = /* wgsl */ `
 struct Params {
   n_tokens: u32,
-  _pad0: u32,
-  _pad1: u32,
+  multi_bounce: u32,
+  bounce_count: f32,
   _pad2: u32,
 };
 
@@ -707,31 +716,53 @@ fn softplus_i0(x: f32) -> f32 {
   return min(sp, 64.0);
 }
 
+fn decode_sh_elem(base: u32, k: u32, i0r: f32, i0g: f32, i0b: f32) -> f32 {
+  if (k == 0u) { return i0r; }
+  if (k == 1u) { return i0g; }
+  if (k == 2u) { return i0b; }
+  if (k == 3u) { return i0r * tanh(clamp(raw_in[base + 3u], -15.0, 15.0)); }
+  if (k == 4u) { return i0g * tanh(clamp(raw_in[base + 4u], -15.0, 15.0)); }
+  if (k == 5u) { return i0b * tanh(clamp(raw_in[base + 5u], -15.0, 15.0)); }
+  if (k == 6u) { return i0r * tanh(clamp(raw_in[base + 6u], -15.0, 15.0)); }
+  if (k == 7u) { return i0g * tanh(clamp(raw_in[base + 7u], -15.0, 15.0)); }
+  if (k == 8u) { return i0b * tanh(clamp(raw_in[base + 8u], -15.0, 15.0)); }
+  if (k == 9u) { return i0r / (1.0 + exp(-clamp(raw_in[base + 9u], -20.0, 20.0))); }
+  if (k == 10u) { return i0g / (1.0 + exp(-clamp(raw_in[base + 10u], -20.0, 20.0))); }
+  return i0b / (1.0 + exp(-clamp(raw_in[base + 11u], -20.0, 20.0)));
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= params.n_tokens) { return; }
-  let b = i * 12u;
+  let dst = i * 12u;
 
-  let i0r = softplus_i0(raw_in[b + 0u]);
-  let i0g = softplus_i0(raw_in[b + 1u]);
-  let i0b = softplus_i0(raw_in[b + 2u]);
+  if (params.multi_bounce == 0u) {
+    let i0r = softplus_i0(raw_in[dst + 0u]);
+    let i0g = softplus_i0(raw_in[dst + 1u]);
+    let i0b = softplus_i0(raw_in[dst + 2u]);
+    for (var k: u32 = 0u; k < 12u; k++) {
+      sh_out[dst + k] = decode_sh_elem(dst, k, i0r, i0g, i0b);
+    }
+    return;
+  }
 
-  sh_out[b + 0u] = i0r;
-  sh_out[b + 1u] = i0g;
-  sh_out[b + 2u] = i0b;
+  let b1 = i * 36u;
+  let b2 = b1 + 12u;
+  let b3 = b1 + 24u;
+  let w2 = clamp(params.bounce_count - 1.0, 0.0, 1.0);
+  let w3 = clamp(params.bounce_count - 2.0, 0.0, 1.0);
 
-  sh_out[b + 3u] = i0r * tanh(clamp(raw_in[b + 3u], -15.0, 15.0));
-  sh_out[b + 4u] = i0g * tanh(clamp(raw_in[b + 4u], -15.0, 15.0));
-  sh_out[b + 5u] = i0b * tanh(clamp(raw_in[b + 5u], -15.0, 15.0));
+  let r1 = softplus_i0(raw_in[b1 + 0u]); let g1 = softplus_i0(raw_in[b1 + 1u]); let bl1 = softplus_i0(raw_in[b1 + 2u]);
+  let r2 = softplus_i0(raw_in[b2 + 0u]); let g2 = softplus_i0(raw_in[b2 + 1u]); let bl2 = softplus_i0(raw_in[b2 + 2u]);
+  let r3 = softplus_i0(raw_in[b3 + 0u]); let g3 = softplus_i0(raw_in[b3 + 1u]); let bl3 = softplus_i0(raw_in[b3 + 2u]);
 
-  sh_out[b + 6u] = i0r * tanh(clamp(raw_in[b + 6u], -15.0, 15.0));
-  sh_out[b + 7u] = i0g * tanh(clamp(raw_in[b + 7u], -15.0, 15.0));
-  sh_out[b + 8u] = i0b * tanh(clamp(raw_in[b + 8u], -15.0, 15.0));
-
-  sh_out[b + 9u]  = i0r / (1.0 + exp(-clamp(raw_in[b + 9u], -20.0, 20.0)));
-  sh_out[b + 10u] = i0g / (1.0 + exp(-clamp(raw_in[b + 10u], -20.0, 20.0)));
-  sh_out[b + 11u] = i0b / (1.0 + exp(-clamp(raw_in[b + 11u], -20.0, 20.0)));
+  for (var k: u32 = 0u; k < 12u; k++) {
+    let v1 = decode_sh_elem(b1, k, r1, g1, bl1);
+    let v2 = decode_sh_elem(b2, k, r2, g2, bl2);
+    let v3 = decode_sh_elem(b3, k, r3, g3, bl3);
+    sh_out[dst + k] = v1 + w2 * v2 + w3 * v3;
+  }
 }
 `;
 
@@ -749,7 +780,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  *   vec4[5]: I1_world_B.xyz, gtErrorScalar (optional diagnostic)
  */
 export const WORLD_PATCH_VEC4S = 6;
-export const MAX_RENDER_PATCHES = 1024;
+export const MAX_PATCHES_PER_OBJECT = 64;
+export const MAX_RENDER_OBJECTS = 48;
+export const MAX_RENDER_PATCHES = 2048;
 
 export class RadiantComputeEngine {
   public device: GPUDevice | null;
@@ -819,12 +852,18 @@ export class RadiantComputeEngine {
 
   // Shared Three.js TSL StorageBufferAttribute (WebGPU) + RGBA32F DataTexture (WebGL2 fallback)
   public readonly worldPatchArray = new Float32Array(MAX_RENDER_PATCHES * WORLD_PATCH_VEC4S * 4);
+  public readonly worldPatchTexArray = new Float32Array(
+    MAX_RENDER_OBJECTS * MAX_PATCHES_PER_OBJECT * WORLD_PATCH_VEC4S * 4,
+  );
   public readonly worldPatchStorage: THREE.StorageBufferAttribute;
   public readonly worldPatchTexture: THREE.DataTexture;
   public activeTokenCount = 0;
+  public bounceCount = 3.0;
   public lastComputeMs = 0;
   public lastLocalSH: Float32Array = new Float32Array(0);
+  public lastRawBounces: Float32Array = new Float32Array(0);
   public lastWorldTokens: Float32Array = new Float32Array(0);
+  private lastObjectRanges: ObjectPatchRange[] | null = null;
 
   // Cached GPUBindGroups (rebuilt only when capacity or weights change — zero per-frame allocation!)
   private cachedBGs: {
@@ -874,9 +913,9 @@ export class RadiantComputeEngine {
     this.hasF16 = Boolean(device && device.features && device.features.has('shader-f16'));
     this.worldPatchStorage = new THREE.StorageBufferAttribute(this.worldPatchArray, 4);
     this.worldPatchTexture = new THREE.DataTexture(
-      this.worldPatchArray,
-      PATCHES_PER_OBJECT * WORLD_PATCH_VEC4S, // 192 vec4s per object row
-      MAX_RENDER_PATCHES / PATCHES_PER_OBJECT, // 32 objects max
+      this.worldPatchTexArray,
+      MAX_PATCHES_PER_OBJECT * WORLD_PATCH_VEC4S, // 384 vec4s per object row (supports up to 64 patches/object!)
+      MAX_RENDER_OBJECTS, // 48 objects max
       THREE.RGBAFormat,
       THREE.FloatType,
     );
@@ -1176,6 +1215,7 @@ export class RadiantComputeEngine {
     this.isQ8Turbo = false;
     this.q8Layout = null;
 
+    const flags = dv.getUint32(28, true);
     this.header = {
       version: dv.getUint32(4, true),
       dModel: dv.getUint32(8, true),
@@ -1183,8 +1223,10 @@ export class RadiantComputeEngine {
       nLayers: dv.getUint32(16, true),
       dFF: dv.getUint32(20, true),
       nTensors: dv.getUint32(24, true),
-      flags: dv.getUint32(28, true),
+      flags,
       posScale: dv.getFloat32(32, true),
+      hasAreaPrior: (flags & 2) !== 0,
+      isMultiBounce: (flags & 4) !== 0,
     };
 
     const { dModel, nHeads, nLayers, dFF } = this.header;
@@ -1227,11 +1269,12 @@ export class RadiantComputeEngine {
       });
     }
 
+    const head2OutDim = this.header.isMultiBounce ? 36 : 12;
     const finalNormW = alloc(dModel);
     const head1W = alloc(dModel * dModel);
     const head1B = alloc(dModel);
-    const head2W = alloc(12 * dModel);
-    const head2B = alloc(12);
+    const head2W = alloc(head2OutDim * dModel);
+    const head2B = alloc(head2OutDim);
 
     const expectedBytes = 64 + elemOff * 2;
     if (buffer.byteLength !== expectedBytes) {
@@ -1266,6 +1309,7 @@ export class RadiantComputeEngine {
     this.isQ8Turbo = true;
     const q8U32Len = dv.getUint32(24, true);
     const f32Len = dv.getUint32(28, true);
+    const featFlags = dv.getUint32(36, true);
     this.header = {
       version: dv.getUint32(4, true),
       dModel: dv.getUint32(8, true),
@@ -1273,8 +1317,10 @@ export class RadiantComputeEngine {
       nLayers: dv.getUint32(16, true),
       dFF: dv.getUint32(20, true),
       nTensors: q8U32Len,
-      flags: 8,
+      flags: 8 | (featFlags << 8),
       posScale: dv.getFloat32(32, true),
+      hasAreaPrior: (featFlags & 1) !== 0,
+      isMultiBounce: (featFlags & 2) !== 0,
     };
 
     const expectedBytes = 64 + q8U32Len * 4 + f32Len * 4;
@@ -1322,12 +1368,13 @@ export class RadiantComputeEngine {
       layers.push({ norm1W, qkvW, qkvS, qkvB, wOW, wOS, wOB, norm2W, fc1W, fc1S, fc1B, fc2W, fc2S, fc2B });
     }
 
+    const head2OutDim = this.header.isMultiBounce ? 36 : 12;
     const finalNormW = allocAux(dModel);
     const head1W = allocQ8(dModel, dModel);
     const head1S = allocAux(dModel);
     const head1B = allocAux(dModel);
-    const head2W = allocAux(12 * dModel);
-    const head2B = allocAux(12);
+    const head2W = allocAux(head2OutDim * dModel);
+    const head2B = allocAux(head2OutDim);
 
     if (q8Off !== q8U32Len || auxOff !== f32Len) {
       throw new Error(`RDG8 offset mismatch: q8=${q8Off}/${q8U32Len}, aux=${auxOff}/${f32Len}`);
@@ -1460,7 +1507,7 @@ export class RadiantComputeEngine {
     this.kBuf = mkBuf(cap * nHeads * 32);
     this.vBuf = mkBuf(cap * nHeads * 32);
     this.attnMergedBuf = mkBuf(cap * dModel);
-    this.rawHeadBuf = mkBuf(cap * SH_STRIDE);
+    this.rawHeadBuf = mkBuf(cap * 36);
     this.shOutBuf = mkBuf(cap * SH_STRIDE);
     this.worldPatchGpuBuf = mkBuf(cap * WORLD_PATCH_VEC4S * 4);
     this.readbackBuf = device.createBuffer({
@@ -1479,10 +1526,13 @@ export class RadiantComputeEngine {
     tokens: Float32Array,
     updateWorldStorage = true,
     readback = true,
+    objectRanges?: ObjectPatchRange[] | null,
+    bounceOverride?: number,
   ): Promise<Float32Array> {
     const tokensSnap = new Float32Array(tokens);
+    const rangesSnap = objectRanges ? objectRanges.map((r) => ({ ...r })) : null;
     const task = this.inferQueue.then(() =>
-      this._runInferTokens(tokensSnap, updateWorldStorage, readback),
+      this._runInferTokens(tokensSnap, updateWorldStorage, readback, rangesSnap, bounceOverride),
     );
     this.inferQueue = task.then(
       () => undefined,
@@ -1491,28 +1541,119 @@ export class RadiantComputeEngine {
     return task;
   }
 
+  /**
+   * Instant 0-ms bounce-depth switching (1 Bounce / 2 Bounce / 3 Bounce) without re-running the
+   * 9-layer Transformer! Re-decodes cached `rawHeadBuf` on GPU (or `lastRawBounces` on CPU) in < 0.1 ms.
+   */
+  public async setBounceCount(
+    bounces: number,
+    updateWorldStorage = true,
+    objectRanges?: ObjectPatchRange[] | null,
+    readback = false,
+  ): Promise<Float32Array> {
+    const clamped = Math.max(1.0, Math.min(3.0, bounces));
+    this.bounceCount = clamped;
+    const nTokens = this.activeTokenCount;
+    if (nTokens <= 0 || !this.isWeightsLoaded) return this.lastLocalSH;
+    const ranges = objectRanges ?? this.lastObjectRanges;
+
+    if (this.isCPUFallback || !this.device) {
+      if (this.lastRawBounces.length > 0) {
+        const combined = combineBounceSH(this.lastRawBounces, nTokens, clamped, Boolean(this.header?.isMultiBounce));
+        this.lastLocalSH = combined;
+        if (updateWorldStorage && this.lastWorldTokens.length >= nTokens * TOKEN_STRIDE) {
+          this.uploadWorldSHToTSL(this.lastWorldTokens, combined, nTokens, null, ranges);
+        }
+        return combined;
+      }
+      return this.lastLocalSH;
+    }
+
+    if (!this.cachedBGs) this._rebuildBindGroups();
+    const bgs = this.cachedBGs!;
+    const threeDstBuf: GPUBuffer | undefined =
+      updateWorldStorage && !this.useTextureLookup
+        ? this.rendererBackend?.get?.(this.worldPatchStorage)?.buffer
+        : undefined;
+
+    const base0 = 0;
+    this.paramsCPU[base0 + 0] = nTokens >>> 0;
+    this.paramsCPU[base0 + 1] = this.header.isMultiBounce ? 1 : 0;
+    this.paramsCPUF32[base0 + 2] = clamped;
+    this.paramsCPU[base0 + 3] = 0;
+
+    const base1 = this.PARAM_STRIDE_BYTES >> 2;
+    this.paramsCPU[base1 + 0] = Math.min(nTokens, MAX_RENDER_PATCHES) >>> 0;
+    this.paramsCPU[base1 + 1] = 0;
+    this.paramsCPU[base1 + 2] = 0;
+    this.paramsCPU[base1 + 3] = 0;
+
+    this.device.queue.writeBuffer(this.paramsRingBuf, 0, this.paramsCPU.buffer, 0, this.PARAM_STRIDE_BYTES * 2);
+
+    const enc = this.device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.pipeDecode);
+    pass.setBindGroup(0, bgs.decode, [0]);
+    pass.dispatchWorkgroups(Math.ceil(nTokens / 64), 1, 1);
+    if (threeDstBuf) {
+      pass.setPipeline(this.pipePackWorldSH);
+      pass.setBindGroup(0, bgs.packWorldSH, [this.PARAM_STRIDE_BYTES]);
+      pass.dispatchWorkgroups(Math.ceil(Math.min(nTokens, MAX_RENDER_PATCHES) / 64), 1, 1);
+    }
+    pass.end();
+
+    const outBytes = nTokens * SH_STRIDE * 4;
+    if (threeDstBuf) {
+      const packBytes = Math.min(nTokens, MAX_RENDER_PATCHES) * WORLD_PATCH_VEC4S * 4 * 4;
+      enc.copyBufferToBuffer(this.worldPatchGpuBuf, 0, threeDstBuf, 0, packBytes);
+      if (!readback) {
+        this.device.queue.submit([enc.finish()]);
+        await this.device.queue.onSubmittedWorkDone();
+        return this.lastLocalSH;
+      }
+    }
+
+    enc.copyBufferToBuffer(this.shOutBuf, 0, this.readbackBuf, 0, outBytes);
+    this.device.queue.submit([enc.finish()]);
+    await this.readbackBuf.mapAsync(GPUMapMode.READ, 0, outBytes);
+    const mapped = new Float32Array(this.readbackBuf.getMappedRange(0, outBytes));
+    const result = new Float32Array(mapped);
+    this.readbackBuf.unmap();
+    this.lastLocalSH = result;
+    if (!threeDstBuf && updateWorldStorage && this.lastWorldTokens.length >= nTokens * TOKEN_STRIDE) {
+      this.uploadWorldSHToTSL(this.lastWorldTokens, result, nTokens, null, ranges);
+    }
+    return result;
+  }
+
   private async _runInferTokens(
     tokens: Float32Array,
     updateWorldStorage: boolean,
     readback: boolean,
+    objectRanges: ObjectPatchRange[] | null,
+    bounceOverride?: number,
   ): Promise<Float32Array> {
     this.isBusy = true;
     try {
       const nTokens = Math.floor(tokens.length / TOKEN_STRIDE);
       if (nTokens <= 0) return new Float32Array(0);
+      const effBounces = bounceOverride !== undefined ? bounceOverride : this.bounceCount;
+      if (objectRanges) this.lastObjectRanges = objectRanges;
       if (this.isCPUFallback || !this.device) {
         if (!this.cpuWeightsF32 && !this.cpuWorker) return new Float32Array(nTokens * SH_STRIDE);
         const t0 = performance.now();
         const workerOut = await this._runCpuWorker(tokens, nTokens);
-        const result = workerOut
+        const rawDecoded = workerOut
           ? workerOut.result
           : await runRadiantCPU(tokens, nTokens, this.header, this.cpuWeightsF32!, this.layout);
+        const result = combineBounceSH(rawDecoded, nTokens, effBounces, Boolean(this.header?.isMultiBounce));
         this.lastComputeMs = workerOut ? workerOut.computeMs : performance.now() - t0;
         this.activeTokenCount = nTokens;
+        this.lastRawBounces = rawDecoded;
         this.lastLocalSH = result;
         this.lastWorldTokens = new Float32Array(tokens.subarray(0, nTokens * TOKEN_STRIDE));
         if (updateWorldStorage) {
-          this.uploadWorldSHToTSL(tokens, result, nTokens);
+          this.uploadWorldSHToTSL(tokens, result, nTokens, null, objectRanges);
         }
         return result;
       }
@@ -1520,7 +1661,8 @@ export class RadiantComputeEngine {
       this._ensureCapacity(nTokens);
 
       const t0 = performance.now();
-      const { dModel, nHeads, nLayers, dFF, posScale } = this.header;
+      const { dModel, nHeads, nLayers, dFF, posScale, hasAreaPrior, isMultiBounce } = this.header;
+      const head2OutDim = isMultiBounce ? 36 : 12;
 
       // Upload input tokens
       this.device.queue.writeBuffer(this.tokensBuf, 0, tokens.buffer, tokens.byteOffset, nTokens * TOKEN_STRIDE * 4);
@@ -1533,12 +1675,21 @@ export class RadiantComputeEngine {
         for (let k = 0; k < vals.length; k++) this.paramsCPU[base + k] = vals[k] >>> 0;
         return s * this.PARAM_STRIDE_BYTES;
       };
-      const pushPrep = (n: number, scale: number): number => {
+      const pushPrep = (n: number, scale: number, areaPrior: boolean): number => {
         const s = slot++;
         const base = (s * this.PARAM_STRIDE_BYTES) >> 2;
         this.paramsCPU[base + 0] = n >>> 0;
         this.paramsCPUF32[base + 1] = scale;
-        this.paramsCPU[base + 2] = 0;
+        this.paramsCPU[base + 2] = areaPrior ? 1 : 0;
+        this.paramsCPU[base + 3] = 0;
+        return s * this.PARAM_STRIDE_BYTES;
+      };
+      const pushDecode = (n: number, multiB: boolean, bCount: number): number => {
+        const s = slot++;
+        const base = (s * this.PARAM_STRIDE_BYTES) >> 2;
+        this.paramsCPU[base + 0] = n >>> 0;
+        this.paramsCPU[base + 1] = multiB ? 1 : 0;
+        this.paramsCPUF32[base + 2] = bCount;
         this.paramsCPU[base + 3] = 0;
         return s * this.PARAM_STRIDE_BYTES;
       };
@@ -1562,7 +1713,7 @@ export class RadiantComputeEngine {
       if (this.isQ8Turbo && this.q8Layout) {
         const QL = this.q8Layout;
         const offCentroid = pushU32(nTokens, 0, 0, 0);
-        const offPrep = pushPrep(nTokens, posScale);
+        const offPrep = pushPrep(nTokens, posScale, hasAreaPrior);
         const offStem1 = pushU32(nTokens, 13, dModel, QL.stem1W, QL.stem1B, 1, 0, 0);
         const offStem2 = pushU32(nTokens, dModel, dModel, QL.stem2W, QL.stem2S, QL.stem2B, 0, 0);
 
@@ -1580,8 +1731,8 @@ export class RadiantComputeEngine {
 
         const offFinalNorm = pushU32(nTokens, dModel, QL.finalNormW, 0);
         const offHead1 = pushU32(nTokens, dModel, dModel, QL.head1W, QL.head1S, QL.head1B, 1, 0);
-        const offHead2 = pushU32(nTokens, dModel, 12, QL.head2W, QL.head2B, 0, 0, 0);
-        const offDecode = pushU32(nTokens, 0, 0, 0);
+        const offHead2 = pushU32(nTokens, dModel, head2OutDim, QL.head2W, QL.head2B, 0, 0, 0);
+        const offDecode = pushDecode(nTokens, isMultiBounce, effBounces);
         const offPack = useZeroReadback ? pushU32(Math.min(nTokens, MAX_RENDER_PATCHES), 0, 0, 0) : 0;
 
         this.device.queue.writeBuffer(this.paramsRingBuf, 0, this.paramsCPU.buffer, 0, slot * this.PARAM_STRIDE_BYTES);
@@ -1656,9 +1807,9 @@ export class RadiantComputeEngine {
         }
         pass.end();
       } else {
-        // Legacy RDGI v1 FP16 path (100% preserved)
+        // Legacy RDGI v1 FP16 path (100% preserved + Area-Prior & Multi-Bounce support)
         const offCentroid = pushU32(nTokens, 0, 0, 0);
-        const offPrep = pushPrep(nTokens, posScale);
+        const offPrep = pushPrep(nTokens, posScale, hasAreaPrior);
         const offStem1 = pushU32(nTokens, 13, dModel, this.layout.stem1W, this.layout.stem1B, 1, 0, 0);
         const offStem2 = pushU32(nTokens, dModel, dModel, this.layout.stem2W, this.layout.stem2B, 0, 0, 0);
 
@@ -1679,8 +1830,8 @@ export class RadiantComputeEngine {
 
         const offFinalNorm = pushU32(nTokens, dModel, this.layout.finalNormW, 0);
         const offHead1 = pushU32(nTokens, dModel, dModel, this.layout.head1W, this.layout.head1B, 1, 0, 0);
-        const offHead2 = pushU32(nTokens, dModel, 12, this.layout.head2W, this.layout.head2B, 0, 0, 0);
-        const offDecode = pushU32(nTokens, 0, 0, 0);
+        const offHead2 = pushU32(nTokens, dModel, head2OutDim, this.layout.head2W, this.layout.head2B, 0, 0, 0);
+        const offDecode = pushDecode(nTokens, isMultiBounce, effBounces);
         const offPack = useZeroReadback ? pushU32(Math.min(nTokens, MAX_RENDER_PATCHES), 0, 0, 0) : 0;
 
         this.device.queue.writeBuffer(this.paramsRingBuf, 0, this.paramsCPU.buffer, 0, slot * this.PARAM_STRIDE_BYTES);
@@ -1743,7 +1894,7 @@ export class RadiantComputeEngine {
         pass.dispatchWorkgroups(nTokens, 1, 1);
 
         dispatchLinear(bgs.head1, offHead1, dModel);
-        dispatchLinear(bgs.head2, offHead2, 12);
+        dispatchLinear(bgs.head2, offHead2, head2OutDim);
 
         pass.setPipeline(this.pipeDecode);
         pass.setBindGroup(0, bgs.decode, [offDecode]);
@@ -1792,7 +1943,7 @@ export class RadiantComputeEngine {
             this.cpuWeightsF32 = unpackRDGIWeightsF32(this.rawWeightsBuffer);
           }
         }
-        return this._runInferTokens(tokens, updateWorldStorage, readback);
+        return this._runInferTokens(tokens, updateWorldStorage, readback, objectRanges, bounceOverride);
       }
 
       if (useZeroReadback) {
@@ -1814,7 +1965,7 @@ export class RadiantComputeEngine {
       this.lastWorldTokens = new Float32Array(tokens.subarray(0, nTokens * TOKEN_STRIDE));
 
       if (updateWorldStorage) {
-        this.uploadWorldSHToTSL(tokens, result, nTokens);
+        this.uploadWorldSHToTSL(tokens, result, nTokens, null, objectRanges);
       }
       return result;
     } finally {
@@ -1824,14 +1975,15 @@ export class RadiantComputeEngine {
 
   /**
    * Convert local Order-1 SH [N, 12] to world-space Order-1 SH and pack into `worldPatchStorage`
-   * (readable directly by `radiantGINode.ts` in Three.js TSL).
-   * Optionally supply `gtLocalSH` to populate per-patch error in vec4[5].w for the X-Ray Error Heatmap!
+   * (WebGPU StorageBufferAttribute) AND `worldPatchTexture` (WebGL2 RGBA32F DataTexture with
+   * per-object variable LOD rows up to 64 patches/object!).
    */
   public uploadWorldSHToTSL(
     tokens: Float32Array,
     shLocal: Float32Array,
     nTokens: number,
     gtLocalSH?: Float32Array | null,
+    objectRanges?: ObjectPatchRange[] | null,
   ): void {
     const count = Math.min(
       nTokens,
@@ -1858,7 +2010,6 @@ export class RadiantComputeEngine {
       const ibr = shLocal[sb + 6], ibg = shLocal[sb + 7], ibb = shLocal[sb + 8];
       const inr = shLocal[sb + 9], ing = shLocal[sb + 10], inb = shLocal[sb + 11];
 
-      // Convert local (IT, IB, IN) -> world 3D vectors for R, G, B
       const wrx = itr * tx + ibr * bx + inr * nx;
       const wry = itr * ty + ibr * by + inr * ny;
       const wrz = itr * tz + ibr * bz + inr * nz;
@@ -1879,22 +2030,43 @@ export class RadiantComputeEngine {
         errVal = Math.sqrt((dr * dr + dg * dg + dbErr * dbErr) / 3.0);
       }
 
-      // vec4[0]: pos.xyz, patchRadius
       dst[db + 0] = px; dst[db + 1] = py; dst[db + 2] = pz; dst[db + 3] = radius;
-      // vec4[1]: N.xyz, area
       dst[db + 4] = nx; dst[db + 5] = ny; dst[db + 6] = nz; dst[db + 7] = area;
-      // vec4[2]: I0.rgb, I1_N.r
       dst[db + 8] = i0r; dst[db + 9] = i0g; dst[db + 10] = i0b; dst[db + 11] = inr;
-      // vec4[3]: I1_world_R.xyz, I1_N.g
       dst[db + 12] = wrx; dst[db + 13] = wry; dst[db + 14] = wrz; dst[db + 15] = ing;
-      // vec4[4]: I1_world_G.xyz, I1_N.b
       dst[db + 16] = wgx; dst[db + 17] = wgy; dst[db + 18] = wgz; dst[db + 19] = inb;
-      // vec4[5]: I1_world_B.xyz, errVal
       dst[db + 20] = wbx; dst[db + 21] = wby; dst[db + 22] = wbz; dst[db + 23] = errVal;
     }
 
+    // Mirror into per-object rows of WebGL2 RGBA32F DataTexture (supports mixed 4/8/16/32/64 LODs!)
+    if (this.useTextureLookup) {
+      const texDst = this.worldPatchTexArray;
+      const rowStrideFloats = MAX_PATCHES_PER_OBJECT * WORLD_PATCH_VEC4S * 4;
+      const patchFloats = WORLD_PATCH_VEC4S * 4;
+      const ranges = objectRanges ?? this.lastObjectRanges;
+      if (ranges && ranges.length > 0) {
+        for (const r of ranges) {
+          if (r.objectId < 0 || r.objectId >= MAX_RENDER_OBJECTS) continue;
+          const kCount = Math.min(r.patchCount, MAX_PATCHES_PER_OBJECT, Math.max(0, count - r.patchStart));
+          if (kCount <= 0) continue;
+          const srcOff = r.patchStart * patchFloats;
+          const dstOff = r.objectId * rowStrideFloats;
+          texDst.set(dst.subarray(srcOff, srcOff + kCount * patchFloats), dstOff);
+        }
+      } else {
+        // Legacy uniform-32 fallback layout
+        const nObjs = Math.min(MAX_RENDER_OBJECTS, Math.ceil(count / PATCHES_PER_OBJECT));
+        for (let o = 0; o < nObjs; o++) {
+          const kCount = Math.min(PATCHES_PER_OBJECT, count - o * PATCHES_PER_OBJECT);
+          const srcOff = o * PATCHES_PER_OBJECT * patchFloats;
+          const dstOff = o * rowStrideFloats;
+          texDst.set(dst.subarray(srcOff, srcOff + kCount * patchFloats), dstOff);
+        }
+      }
+      this.worldPatchTexture.needsUpdate = true;
+    }
+
     this.worldPatchStorage.needsUpdate = true;
-    this.worldPatchTexture.needsUpdate = true;
   }
 
   public getPatchOffsetForObject(objectId: number): number {

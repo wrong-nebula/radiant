@@ -125,12 +125,14 @@ def trace_scene_specs_batched(
     base_seed: int = 1000,
     device: str = "cuda:0",
     log_prefix: str = "datagen",
+    per_bounce: bool = False,
 ) -> dict[str, np.ndarray]:
     """Trace a list of scene specs in mega-batches on GPU and return packed CSR dataset in RAM."""
     wp.init()
     n_scenes = len(specs)
     all_tokens: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
+    all_bounces: list[np.ndarray] = []
     all_oids: list[np.ndarray] = []
     scene_offsets = np.zeros((n_scenes + 1,), dtype=np.int64)
 
@@ -173,12 +175,19 @@ def trace_scene_specs_batched(
             seed=base_seed + start,
             include_direct_bounce0=False,
             device=device,
+            per_bounce=per_bounce,
         )
 
         p_off = 0
         for local_i, (g, cnt) in enumerate(zip(geoms, p_counts)):
             all_tokens.append(_pack_token_features(g).astype(np.float16))
-            all_targets.append(sh_batch[p_off : p_off + cnt].astype(np.float16))
+            sl = sh_batch[p_off : p_off + cnt]
+            if per_bounce:
+                tot = (sl[:, 0:12] + sl[:, 12:24] + sl[:, 24:36]).astype(np.float16)
+                all_targets.append(tot)
+                all_bounces.append(sl.astype(np.float16))
+            else:
+                all_targets.append(sl.astype(np.float16))
             all_oids.append(g["patch_oid"].astype(np.int16))
             p_off += cnt
             cursor += cnt
@@ -194,12 +203,15 @@ def trace_scene_specs_batched(
             )
 
     pool.shutdown(wait=True)
-    return {
+    out = {
         "tokens_fp16": np.concatenate(all_tokens, axis=0),     # [total_patches, 21] fp16
-        "targets_fp16": np.concatenate(all_targets, axis=0),   # [total_patches, 12] fp16
+        "targets_fp16": np.concatenate(all_targets, axis=0),   # [total_patches, 12] fp16 (3-bounce total)
         "object_ids": np.concatenate(all_oids, axis=0),        # [total_patches] int16
         "scene_offsets": scene_offsets,                        # [n_scenes + 1] int64
     }
+    if per_bounce:
+        out["bounces_fp16"] = np.concatenate(all_bounces, axis=0)  # [total_patches, 36] fp16 ([b1, b2, b3])
+    return out
 
 
 def build_datasets_in_ram(

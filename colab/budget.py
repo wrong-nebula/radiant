@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LEDGER_PATH = REPO_ROOT / "colab" / "budget_ledger.jsonl"
 
 A100_UNITS_PER_HOUR = 15.0
-HARD_CAMPAIGN_CAP_UNITS = 25.0
+HARD_CAMPAIGN_CAP_UNITS = 60.0
 
 HARDWARE_RATES: dict[str, float] = {
     "A100": 15.0,

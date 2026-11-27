@@ -137,6 +137,16 @@ def verify_all(seal: bool = False) -> dict:
     local_se3 = measure_se3_invariance_drift(model, heldout, device, n_scenes=32, n_transforms=3)
     local_occ = evaluate_dynamic_occlusion(model, occ, device)
 
+    local_lod = None
+    if "lod_tokens_fp16" in npz:
+        lod_heldout = {
+            "tokens_fp16": npz["lod_tokens_fp16"],
+            "targets_fp16": npz["lod_targets_fp16"],
+            "object_ids": npz["lod_object_ids"],
+            "scene_offsets": npz["lod_scene_offsets"],
+        }
+        local_lod = evaluate_model_on_heldout(model, lod_heldout, device, random_se3=False, batch_size=16, use_bf16=False)
+
     # 3. Disk hygiene & Colab VM hygiene
     disk_mb, bin_mb = compute_local_disk_mb()
     cum_units = get_cumulative_units()
@@ -159,6 +169,7 @@ def verify_all(seal: bool = False) -> dict:
         local_aligned["psnr_db"] >= 28.0
         and local_rotated["psnr_db"] >= 28.0
         and local_aligned["color_bleed_r"] >= 0.92
+        and (local_lod is None or (local_lod["psnr_db"] >= 28.0 and local_lod["color_bleed_r"] >= 0.92))
         and local_occ["mean_pred_drop_ratio"] >= 0.40
         and local_occ["mean_gt_drop_ratio"] >= 0.40
     )
@@ -200,6 +211,8 @@ def verify_all(seal: bool = False) -> dict:
                 "sh_dir_cosine": local_aligned["sh_dir_cosine"],
                 "occlusion_gt_drop": local_occ["mean_gt_drop_ratio"],
                 "occlusion_pred_drop": local_occ["mean_pred_drop_ratio"],
+                "mixed_lod_psnr_db": local_lod["psnr_db"] if local_lod else None,
+                "mixed_lod_color_bleed_r": local_lod["color_bleed_r"] if local_lod else None,
             },
             "O4_pytorch_to_wgsl_parity": {
                 "passed": o4_ok,

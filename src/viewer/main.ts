@@ -18,16 +18,20 @@ import { TransformControls } from 'three/examples/jsm/controls/TransformControls
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 import {
+  LODMode,
   LocalObjectTokens,
+  ObjectPatchRange,
   PATCHES_PER_OBJECT,
   RadiantComputeEngine,
+  RadiantGIObjectHandle,
   SH_STRIDE,
   TOKEN_STRIDE,
   applyRadiantGI,
   computeSHRMSE,
   computeTonemappedPSNR,
   createRadiantGIUniforms,
-  sampleMeshPatches,
+  sampleMeshMultiLOD,
+  selectObjectLOD,
   writeWorldTokens,
 } from '../radiant/index.ts';
 import {
@@ -69,6 +73,11 @@ class RadiantShowcaseApp {
 
   private currentRoomIdx = 0;
   private currentViewMode = 0; // 0=FullGI, 1=Direct, 2=Indirect, 3=Heatmap, 4=Split, 5=Reference1024
+  private lodMode: LODMode = 'auto';
+  private bounceCount = 3;
+  private lastObjectRanges: ObjectPatchRange[] = [];
+  private lastLodCheckTs = 0;
+  private lastCamPos = new THREE.Vector3(Infinity, Infinity, Infinity);
   private showPatches = false;
   private showSHProbes = false;
   private selectedSpec: RoomObjectSpec | null = null;
@@ -245,20 +254,109 @@ class RadiantShowcaseApp {
       this.roomLightBaseIntensity.push(l.intensity);
     }
 
-    // Tokenize every object into 32 local patches & attach drop-in `applyRadiantGI` TSL node
+    // Precompute Multi-LOD (4, 8, 16, 32, 64) local patches & attach drop-in `applyRadiantGI` TSL node
     for (let i = 0; i < built.objects.length; i++) {
       const spec = built.objects[i];
       const mat = spec.mesh.material as THREE.MeshStandardNodeMaterial | THREE.MeshPhysicalNodeMaterial;
       applyRadiantGI(mat, this.engine, i, this.giUniforms, { isEmitter: spec.isEmitter });
       this.roomGroup.add(spec.mesh);
       this.roomObjects.push(spec);
-      this.localTokens.push(sampleMeshPatches(spec.mesh, i, PATCHES_PER_OBJECT));
+      this.localTokens.push(sampleMeshMultiLOD(spec.mesh, i));
     }
 
+    this._syncDistanceLODs(true);
     this._updateRoomButtons(roomIdx);
     this.setViewMode(this.currentViewMode === 5 && !this.isBenchmarkRoom ? 0 : this.currentViewMode);
     await this.recomputeGI();
     this._showToast(`Loaded: ${built.title}`);
+  }
+
+  /**
+   * Re-evaluate per-object Distance Patch LODs (4, 8, 16, 32, 64) from current camera position
+   * and update TSL `patchStart`/`patchCount` uniforms in 0.001 ms (zero shader recompilation!).
+   * Returns true if any object's LOD changed.
+   */
+  private _syncDistanceLODs(force = false): boolean {
+    if (this.isBenchmarkRoom) {
+      this.lastObjectRanges = [];
+      for (let i = 0; i < this.localTokens.length; i++) {
+        const tok = this.localTokens[i];
+        tok.activeLod = 32;
+        tok.patchStart = i * 32;
+        const h = (tok.mesh.material as any)?.userData?.radiantGI as RadiantGIObjectHandle | undefined;
+        if (h) {
+          h.patchStart.value = i * 32;
+          h.patchCount.value = 32;
+        }
+        this.lastObjectRanges.push({ objectId: i, patchStart: i * 32, patchCount: 32 });
+      }
+      return false;
+    }
+
+    let changed = force;
+    let cursor = 0;
+    const ranges: ObjectPatchRange[] = [];
+    for (let i = 0; i < this.localTokens.length; i++) {
+      const tok = this.localTokens[i];
+      const spec = this.roomObjects[i];
+      const nextLod = selectObjectLOD(tok, this.camera, this.lodMode, Boolean(spec?.isEmitter));
+      if (nextLod !== tok.activeLod) {
+        tok.activeLod = nextLod;
+        tok.patches = tok.lods?.[nextLod] ?? tok.patches;
+        changed = true;
+      }
+      const kCount = tok.patches.length;
+      tok.patchStart = cursor;
+      const h = (tok.mesh.material as any)?.userData?.radiantGI as RadiantGIObjectHandle | undefined;
+      if (h) {
+        h.patchStart.value = cursor;
+        h.patchCount.value = kCount;
+      }
+      ranges.push({ objectId: i, patchStart: cursor, patchCount: kCount });
+      cursor += kCount;
+    }
+    this.lastObjectRanges = ranges;
+    return changed;
+  }
+
+  public async setLODMode(mode: LODMode): Promise<void> {
+    this.lodMode = mode;
+    document.querySelectorAll('#lod-buttons button').forEach((btn) => {
+      btn.classList.toggle('active', (btn as HTMLElement).dataset.lod === mode);
+    });
+    this._syncDistanceLODs(true);
+    if (!this.isBenchmarkRoom && this.engine?.isWeightsLoaded) {
+      await this.recomputeGI(true);
+    }
+  }
+
+  public async setBounceCount(bounces: number): Promise<void> {
+    const b = Math.max(1, Math.min(3, Math.round(bounces)));
+    this.bounceCount = b;
+    document.querySelectorAll('#bounce-buttons button').forEach((btn) => {
+      btn.classList.toggle('active', Number((btn as HTMLElement).dataset.bounces) === b);
+    });
+    if (!this.engine?.isWeightsLoaded) return;
+    if (!this.engine.header?.isMultiBounce) {
+      this._showToast('Load v3 multi-bounce weights for exact 1/2/3-bounce decomposition');
+      return;
+    }
+    const updated = await this.engine.setBounceCount(b, true, this.lastObjectRanges, true);
+    if (updated.length > 0) {
+      this.lastPredSH = updated;
+      const tokensSrc = this.isBenchmarkRoom && this.benchmarkTokens ? this.benchmarkTokens : this.worldTokens;
+      const nTokens = Math.floor(tokensSrc.length / TOKEN_STRIDE);
+      this._rebuildOverlays(tokensSrc, updated, nTokens);
+    }
+  }
+
+  public setBounceSaturation(sat: number): void {
+    const clamped = Math.max(0.0, Math.min(2.0, sat));
+    this.giUniforms.giSaturation.value = clamped;
+    const slider = document.getElementById('gi-sat-slider') as HTMLInputElement | null;
+    const valEl = document.getElementById('gi-sat-val');
+    if (slider) slider.value = clamped.toFixed(2);
+    if (valEl) valEl.textContent = `${Math.round(clamped * 100)}%`;
   }
 
   public async recomputeGI(forceReadback = true): Promise<{ computeMs: number; nTokens: number }> {
@@ -267,12 +365,14 @@ class RadiantShowcaseApp {
     if (this.isBenchmarkRoom && this.benchmarkTokens) {
       tokensToRun = this.benchmarkTokens;
     } else {
-      const nTokens = this.localTokens.length * PATCHES_PER_OBJECT;
+      this._syncDistanceLODs(false);
+      let nTokens = 0;
+      for (let i = 0; i < this.localTokens.length; i++) nTokens += this.localTokens[i].patches.length;
       if (this.worldTokens.length !== nTokens * TOKEN_STRIDE) {
         this.worldTokens = new Float32Array(nTokens * TOKEN_STRIDE);
       }
       for (let i = 0; i < this.localTokens.length; i++) {
-        writeWorldTokens(this.localTokens[i], this.worldTokens, i * PATCHES_PER_OBJECT);
+        writeWorldTokens(this.localTokens[i], this.worldTokens, this.localTokens[i].patchStart);
       }
       tokensToRun = this.worldTokens;
     }
@@ -288,7 +388,7 @@ class RadiantShowcaseApp {
 
     if (!needsCPU) {
       // Zero-readback GPU-to-GPU path: packs World SH directly into Three.js StorageBufferAttribute!
-      await this.engine.inferTokens(tokensToRun, true, false);
+      await this.engine.inferTokens(tokensToRun, true, false, this.lastObjectRanges);
       if (gen !== this.roomGeneration) {
         return { computeMs: this.engine.lastComputeMs, nTokens };
       }
@@ -296,7 +396,7 @@ class RadiantShowcaseApp {
       return { computeMs: this.engine.lastComputeMs, nTokens };
     }
 
-    const predSH = await this.engine.inferTokens(tokensToRun, false, true);
+    const predSH = await this.engine.inferTokens(tokensToRun, false, true, this.lastObjectRanges);
     if (gen !== this.roomGeneration) {
       return { computeMs: this.engine.lastComputeMs, nTokens };
     }
@@ -304,7 +404,7 @@ class RadiantShowcaseApp {
 
     const displaySH =
       this.currentViewMode === 5 && this.benchmarkGtSH ? this.benchmarkGtSH : predSH;
-    this.engine.uploadWorldSHToTSL(tokensToRun, displaySH, nTokens, this.benchmarkGtSH);
+    this.engine.uploadWorldSHToTSL(tokensToRun, displaySH, nTokens, this.benchmarkGtSH, this.lastObjectRanges);
 
     this._rebuildOverlays(tokensToRun, displaySH, nTokens);
     this._updateMetricsHUD(this.engine.lastComputeMs, nTokens, 'COMPUTED');
@@ -334,7 +434,7 @@ class RadiantShowcaseApp {
       const tokensSrc = this.isBenchmarkRoom && this.benchmarkTokens ? this.benchmarkTokens : this.worldTokens;
       const nTokens = Math.floor(tokensSrc.length / TOKEN_STRIDE);
       const displaySH = mode === 5 && this.benchmarkGtSH ? this.benchmarkGtSH : this.lastPredSH;
-      this.engine.uploadWorldSHToTSL(tokensSrc, displaySH, nTokens, this.benchmarkGtSH);
+      this.engine.uploadWorldSHToTSL(tokensSrc, displaySH, nTokens, this.benchmarkGtSH, this.lastObjectRanges);
       this._rebuildOverlays(tokensSrc, displaySH, nTokens);
     }
 
@@ -502,15 +602,16 @@ class RadiantShowcaseApp {
         this.roomGroup.add(mesh);
         const spec: RoomObjectSpec = { name: mesh.name, mesh, draggable: true, isEmitter: false };
         this.roomObjects.push(spec);
-        this.localTokens.push(sampleMeshPatches(mesh, objId, PATCHES_PER_OBJECT));
+        this.localTokens.push(sampleMeshMultiLOD(mesh, objId));
         this._selectSpec(spec);
         added++;
       }
     });
 
     if (added > 0) {
+      this._syncDistanceLODs(true);
       await this.recomputeGI();
-      this._showToast(`Added ${filename} (${added * 32} live GI patches)`);
+      this._showToast(`Added ${filename} (Multi-LOD live GI ready)`);
     } else {
       this._showToast(`No meshes found in ${filename}`);
     }
@@ -560,8 +661,17 @@ class RadiantShowcaseApp {
       ...(this.localTokens[idx].materialOverride ?? {}),
       albedo: [col.r, col.g, col.b],
     };
-    // Re-apply TSL node so diffuse bounce picks up new base albedo immediately
-    applyRadiantGI(mat, this.engine, idx, this.giUniforms, { isEmitter: spec.isEmitter });
+    // Update live baseAlbedoScalar uniform directly (zero shader recompile & preserves active LOD uniforms!)
+    const handle = (mat as any).userData?.radiantGI as RadiantGIObjectHandle | undefined;
+    if (handle?.baseAlbedoScalar?.value) {
+      handle.baseAlbedoScalar.value.set(col.r, col.g, col.b);
+    } else {
+      applyRadiantGI(mat, this.engine, idx, this.giUniforms, {
+        isEmitter: spec.isEmitter,
+        patchStart: this.localTokens[idx].patchStart,
+        patchCount: this.localTokens[idx].patches.length,
+      });
+    }
     await this.recomputeGI();
     return true;
   }
@@ -569,15 +679,17 @@ class RadiantShowcaseApp {
   public getObjectMeanIndirectRGB(name: string): [number, number, number] {
     const idx = this.roomObjects.findIndex((o) => o.name === name);
     if (idx < 0 || this.lastPredSH.length === 0) return [0, 0, 0];
-    const start = idx * PATCHES_PER_OBJECT;
+    const tok = this.localTokens[idx];
+    const start = tok ? tok.patchStart : idx * PATCHES_PER_OBJECT;
+    const count = tok ? tok.patches.length : PATCHES_PER_OBJECT;
     let r = 0, g = 0, b = 0;
-    for (let k = 0; k < PATCHES_PER_OBJECT; k++) {
+    for (let k = 0; k < count; k++) {
       const off = (start + k) * SH_STRIDE;
       r += this.lastPredSH[off + 0];
       g += this.lastPredSH[off + 1];
       b += this.lastPredSH[off + 2];
     }
-    return [r / PATCHES_PER_OBJECT, g / PATCHES_PER_OBJECT, b / PATCHES_PER_OBJECT];
+    return [r / Math.max(count, 1), g / Math.max(count, 1), b / Math.max(count, 1)];
   }
 
   /**
@@ -606,7 +718,7 @@ class RadiantShowcaseApp {
         }
       }
 
-      const wgslSH = await this.engine.inferTokens(tokens, false);
+      const wgslSH = await this.engine.inferTokens(tokens, false, true, null, 3.0);
       const rmse = computeSHRMSE(wgslSH, refSH);
       let maxAbs = 0;
       for (let i = 0; i < wgslSH.length; i++) {
@@ -719,6 +831,29 @@ class RadiantShowcaseApp {
       const v = Number(gainSlider.value);
       this.giUniforms.giIntensity.value = v;
       if (gainVal) gainVal.textContent = `${v.toFixed(2)}×`;
+    });
+
+    const satSlider = document.getElementById('gi-sat-slider') as HTMLInputElement;
+    const satVal = document.getElementById('gi-sat-val') as HTMLElement;
+    this.giUniforms.giSaturation.value = Number(satSlider?.value ?? 1.0);
+    satSlider?.addEventListener('input', () => {
+      const v = Number(satSlider.value);
+      this.giUniforms.giSaturation.value = v;
+      if (satVal) satVal.textContent = `${Math.round(v * 100)}%`;
+    });
+
+    document.querySelectorAll('#bounce-buttons button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const b = Number((btn as HTMLElement).dataset.bounces);
+        this.setBounceCount(b);
+      });
+    });
+
+    document.querySelectorAll('#lod-buttons button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const mode = ((btn as HTMLElement).dataset.lod as LODMode) || 'auto';
+        this.setLODMode(mode);
+      });
     });
 
     document.getElementById('chk-patches')?.addEventListener('change', (e) => {
@@ -853,6 +988,21 @@ class RadiantShowcaseApp {
       }
       this.frameCount = 0;
       this.fpsAccumTime = 0;
+    }
+
+    // Dynamic camera-distance Patch LOD check (throttled every 140 ms when camera moves; 0 work when static!)
+    if (
+      !this.isBenchmarkRoom &&
+      this.lodMode !== 'fixed32' &&
+      this.engine?.isWeightsLoaded &&
+      now - this.lastLodCheckTs >= 140 &&
+      this.camera.position.distanceToSquared(this.lastCamPos) > 0.04
+    ) {
+      this.lastLodCheckTs = now;
+      this.lastCamPos.copy(this.camera.position);
+      if (this._syncDistanceLODs(false)) {
+        this.giDirty = true;
+      }
     }
 
     // Non-blocking dirty-flag WebGPU GI recompute (0 ms when static, zero-readback on drag!)

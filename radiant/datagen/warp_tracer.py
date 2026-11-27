@@ -183,7 +183,9 @@ def _trace_patches_3bounce_kernel(
     curr_ro = ro + surf_n * 2.0e-3
     curr_rd = rd0
     throughput = wp.vec3(1.0, 1.0, 1.0)
-    rad = wp.vec3(0.0, 0.0, 0.0)
+    rad1 = wp.vec3(0.0, 0.0, 0.0)
+    rad2 = wp.vec3(0.0, 0.0, 0.0)
+    rad3 = wp.vec3(0.0, 0.0, 0.0)
 
     # Trace up to (max_bounces + 1) segments:
     # b = 0: first hit from patch i. Its emission is DIRECT light (excluded unless include_direct_bounce0 == 1).
@@ -203,12 +205,19 @@ def _trace_patches_3bounce_kernel(
         # Handle potential back-face hit cleanly (treat closed solids: absorb back-face hits unless thin)
         cos_in = wp.dot(curr_rd, hit_n)
         if cos_in > 0.0:
-            # Hit backside of a face; flip only if very close or absorb to prevent light leaking through solid walls
+            # Hit backside of a face; absorb to prevent light leaking through solid walls
             break
 
         em = face_emission[hit_f]
-        if b > 0 or include_direct_bounce0 != 0:
-            rad = rad + wp.cw_mul(throughput, em)
+        contrib = wp.cw_mul(throughput, em)
+        if b == 1:
+            rad1 = rad1 + contrib
+        elif b == 2:
+            rad2 = rad2 + contrib
+        elif b == 3:
+            rad3 = rad3 + contrib
+        elif b == 0 and include_direct_bounce0 != 0:
+            rad1 = rad1 + contrib
 
         if b == max_bounces:
             break
@@ -236,25 +245,55 @@ def _trace_patches_3bounce_kernel(
         curr_rd = next_rd
 
     inv_s = 1.0 / float(rays_per_patch)
-    r_scaled = rad * inv_s
-    base = p_idx * 12
+    s1 = rad1 * inv_s
+    s2 = rad2 * inv_s
+    s3 = rad3 * inv_s
+    base = p_idx * 36
 
-    # Accumulate I0, I1_T, I1_B, I1_N (12 floats per patch)
-    wp.atomic_add(out_sh, base + 0, r_scaled[0])
-    wp.atomic_add(out_sh, base + 1, r_scaled[1])
-    wp.atomic_add(out_sh, base + 2, r_scaled[2])
+    # Accumulate per-bounce Order-1 SH: [b1 (12), b2 (12), b3 (12)] = 36 floats/patch
+    if s1[0] + s1[1] + s1[2] > 0.0:
+        wp.atomic_add(out_sh, base + 0, s1[0])
+        wp.atomic_add(out_sh, base + 1, s1[1])
+        wp.atomic_add(out_sh, base + 2, s1[2])
+        wp.atomic_add(out_sh, base + 3, s1[0] * w_T)
+        wp.atomic_add(out_sh, base + 4, s1[1] * w_T)
+        wp.atomic_add(out_sh, base + 5, s1[2] * w_T)
+        wp.atomic_add(out_sh, base + 6, s1[0] * w_B)
+        wp.atomic_add(out_sh, base + 7, s1[1] * w_B)
+        wp.atomic_add(out_sh, base + 8, s1[2] * w_B)
+        wp.atomic_add(out_sh, base + 9, s1[0] * w_N)
+        wp.atomic_add(out_sh, base + 10, s1[1] * w_N)
+        wp.atomic_add(out_sh, base + 11, s1[2] * w_N)
 
-    wp.atomic_add(out_sh, base + 3, r_scaled[0] * w_T)
-    wp.atomic_add(out_sh, base + 4, r_scaled[1] * w_T)
-    wp.atomic_add(out_sh, base + 5, r_scaled[2] * w_T)
+    if s2[0] + s2[1] + s2[2] > 0.0:
+        b2 = base + 12
+        wp.atomic_add(out_sh, b2 + 0, s2[0])
+        wp.atomic_add(out_sh, b2 + 1, s2[1])
+        wp.atomic_add(out_sh, b2 + 2, s2[2])
+        wp.atomic_add(out_sh, b2 + 3, s2[0] * w_T)
+        wp.atomic_add(out_sh, b2 + 4, s2[1] * w_T)
+        wp.atomic_add(out_sh, b2 + 5, s2[2] * w_T)
+        wp.atomic_add(out_sh, b2 + 6, s2[0] * w_B)
+        wp.atomic_add(out_sh, b2 + 7, s2[1] * w_B)
+        wp.atomic_add(out_sh, b2 + 8, s2[2] * w_B)
+        wp.atomic_add(out_sh, b2 + 9, s2[0] * w_N)
+        wp.atomic_add(out_sh, b2 + 10, s2[1] * w_N)
+        wp.atomic_add(out_sh, b2 + 11, s2[2] * w_N)
 
-    wp.atomic_add(out_sh, base + 6, r_scaled[0] * w_B)
-    wp.atomic_add(out_sh, base + 7, r_scaled[1] * w_B)
-    wp.atomic_add(out_sh, base + 8, r_scaled[2] * w_B)
-
-    wp.atomic_add(out_sh, base + 9, r_scaled[0] * w_N)
-    wp.atomic_add(out_sh, base + 10, r_scaled[1] * w_N)
-    wp.atomic_add(out_sh, base + 11, r_scaled[2] * w_N)
+    if s3[0] + s3[1] + s3[2] > 0.0:
+        b3 = base + 24
+        wp.atomic_add(out_sh, b3 + 0, s3[0])
+        wp.atomic_add(out_sh, b3 + 1, s3[1])
+        wp.atomic_add(out_sh, b3 + 2, s3[2])
+        wp.atomic_add(out_sh, b3 + 3, s3[0] * w_T)
+        wp.atomic_add(out_sh, b3 + 4, s3[1] * w_T)
+        wp.atomic_add(out_sh, b3 + 5, s3[2] * w_T)
+        wp.atomic_add(out_sh, b3 + 6, s3[0] * w_B)
+        wp.atomic_add(out_sh, b3 + 7, s3[1] * w_B)
+        wp.atomic_add(out_sh, b3 + 8, s3[2] * w_B)
+        wp.atomic_add(out_sh, b3 + 9, s3[0] * w_N)
+        wp.atomic_add(out_sh, b3 + 10, s3[1] * w_N)
+        wp.atomic_add(out_sh, b3 + 11, s3[2] * w_N)
 
 
 def trace_scene_patches_warp(
@@ -280,11 +319,13 @@ def trace_scene_patches_warp(
     seed: int = 42,
     include_direct_bounce0: bool = False,
     device: str = "cuda:0",
+    per_bounce: bool = False,
 ) -> np.ndarray:
-    """Trace exact 3-bounce indirect Order-1 SH irradiance for all patches in a scene.
+    """Trace exact 1-, 2-, and 3-bounce indirect Order-1 SH irradiance for all patches in a scene.
 
     Returns:
-        np.ndarray of shape [n_patches, 12], dtype float32.
+        np.ndarray of shape [n_patches, 36] if per_bounce=True ([b1(12), b2(12), b3(12)]),
+        or [n_patches, 12] (b1 + b2 + b3 total) if per_bounce=False, dtype float32.
     """
     n_patches = int(patch_pos.shape[0])
     verts_wp = wp.array(np.ascontiguousarray(verts, dtype=np.float32), dtype=wp.vec3, device=device)
@@ -308,7 +349,7 @@ def trace_scene_patches_warp(
     pB_wp = wp.array(np.ascontiguousarray(patch_B, dtype=np.float32), dtype=wp.vec3, device=device)
     pN_wp = wp.array(np.ascontiguousarray(patch_N, dtype=np.float32), dtype=wp.vec3, device=device)
 
-    out_sh = wp.zeros(n_patches * 12, dtype=float, device=device)
+    out_sh = wp.zeros(n_patches * 36, dtype=float, device=device)
     total_rays = n_patches * rays_per_patch
 
     wp.launch(
@@ -342,4 +383,7 @@ def trace_scene_patches_warp(
         device=device,
     )
     wp.synchronize()
-    return out_sh.numpy().reshape(n_patches, 12).astype(np.float32)
+    sh36 = out_sh.numpy().reshape(n_patches, 36).astype(np.float32)
+    if per_bounce:
+        return sh36
+    return (sh36[:, 0:12] + sh36[:, 12:24] + sh36[:, 24:36]).astype(np.float32)

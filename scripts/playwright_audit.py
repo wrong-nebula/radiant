@@ -168,10 +168,29 @@ def run_audit() -> None:
             p_cornell_shift = snap("06_cornell_color_bleed_shift")
             rgb_after = page.evaluate("() => window.__RADIANT_APP__.getObjectMeanIndirectRGB('Sculptural Knot')")
 
-            # Measure real steady & live-drag FPS on M1 Metal 3 in Room 1
+            # Measure real steady & live-drag FPS on M1 Metal 3 in Room 1 (Auto Distance LOD + Fixed 32 + 1/2/3 Bounce + Saturation!)
             page.evaluate("() => window.__RADIANT_APP__.loadRoom(0)")
+            page.evaluate("() => window.__RADIANT_APP__.setLODMode('auto')")
             perf = page.evaluate("() => window.__RADIANT_APP__.measurePerformance(45, 12)")
-            print(f"[playwright] M1 Metal 3 Performance: {perf}", flush=True)
+            page.evaluate("() => window.__RADIANT_APP__.setLODMode('fixed32')")
+            perf_fixed32 = page.evaluate("() => window.__RADIANT_APP__.measurePerformance(15, 12)")
+            page.evaluate("() => window.__RADIANT_APP__.setLODMode('auto')")
+            print(f"[playwright] M1 Metal 3 Performance (Auto LOD): {perf}", flush=True)
+            print(f"[playwright] M1 Metal 3 Performance (Fixed 32): {perf_fixed32}", flush=True)
+
+            # Verify instant 1-Bounce / 2-Bounce / 3-Bounce & Bounce Saturation controls
+            page.evaluate("() => window.__RADIANT_APP__.setBounceCount(1)")
+            rgb_b1 = page.evaluate("() => window.__RADIANT_APP__.getObjectMeanIndirectRGB('Sculptural Knot')")
+            page.evaluate("() => window.__RADIANT_APP__.setBounceCount(2)")
+            rgb_b2 = page.evaluate("() => window.__RADIANT_APP__.getObjectMeanIndirectRGB('Sculptural Knot')")
+            page.evaluate("() => window.__RADIANT_APP__.setBounceCount(3)")
+            rgb_b3 = page.evaluate("() => window.__RADIANT_APP__.getObjectMeanIndirectRGB('Sculptural Knot')")
+            page.evaluate("() => window.__RADIANT_APP__.setBounceSaturation(0.0)")
+            p_sat0 = snap("14_cornell_sat0_mono")
+            page.evaluate("() => window.__RADIANT_APP__.setBounceSaturation(1.8)")
+            p_sat180 = snap("15_cornell_sat180_vivid")
+            page.evaluate("() => window.__RADIANT_APP__.setBounceSaturation(1.0)")
+            print(f"[playwright] Multi-Bounce RGB (1B/2B/3B): {rgb_b1} / {rgb_b2} / {rgb_b3}", flush=True)
 
             # 2. Room 2: Vaulted Brutalist Gallery
             page.evaluate("() => window.__RADIANT_APP__.loadRoom(1)")
@@ -206,6 +225,7 @@ def run_audit() -> None:
         gi_vs_direct_diff = _img_l1_diff(p_cornell_gi, p_cornell_direct)
         bleed_shift_diff = _img_l1_diff(p_cornell_gi, p_cornell_shift)
         corridor_occ_diff = _img_l1_diff(p_l_open, p_l_occ)
+        sat_shift_diff = _img_l1_diff(p_sat0, p_sat180)
 
         # Hue/RGB shift on Sculptural Knot when walls move/change color
         rgb_b = np.array(rgb_before, dtype=np.float64)
@@ -243,16 +263,21 @@ def run_audit() -> None:
                 "cornell_gi_vs_direct_l1": gi_vs_direct_diff,
                 "cornell_live_bleed_shift_l1": bleed_shift_diff,
                 "lcorridor_open_vs_occluded_l1": corridor_occ_diff,
+                "cornell_sat0_vs_sat180_l1": sat_shift_diff,
             },
             "gpu_indirect_rgb_checks": {
                 "knot_before_rgb": [round(x, 4) for x in rgb_before],
                 "knot_after_shift_rgb": [round(x, 4) for x in rgb_after],
                 "knot_chroma_shift_l2": round(bleed_chroma_shift, 4),
+                "knot_1bounce_rgb": [round(x, 4) for x in rgb_b1],
+                "knot_2bounce_rgb": [round(x, 4) for x in rgb_b2],
+                "knot_3bounce_rgb": [round(x, 4) for x in rgb_b3],
                 "east_sculpt_open_rgb": [round(x, 4) for x in east_open],
                 "east_sculpt_occluded_rgb": [round(x, 4) for x in east_occ],
                 "corridor_occlusion_drop_ratio": round(corridor_drop_ratio, 4),
             },
             "performance_m1": perf,
+            "performance_m1_fixed32": perf_fixed32,
             "screenshots": {k: str(v.relative_to(REPO_ROOT)) for k, v in shots.items()},
             "screenshot_stats": shot_stats,
         }

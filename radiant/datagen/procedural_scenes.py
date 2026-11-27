@@ -17,9 +17,11 @@ import math
 import numpy as np
 
 from radiant.datagen.patch_sampler import (
+    LOD_PATCH_COUNTS,
     PATCHES_PER_OBJECT,
     LocalMeshTemplate,
     build_local_template,
+    build_multi_lod_templates,
     fast_transform_template_patches,
 )
 
@@ -514,23 +516,25 @@ def _try_fetch_cc0_watertight_meshes(cache_dir: str = "/content/cc0_meshes") -> 
 
 
 class ArchetypeLibrary:
-    """Pre-clustered 32-patch local templates for architecture + 200+ watertight sculptural/CC0 meshes."""
+    """Pre-clustered Multi-LOD (4, 8, 16, 32, 64) local templates for architecture + 200+ watertight meshes."""
 
-    def __init__(self, seed: int = 2026, fetch_cc0: bool = True) -> None:
+    def __init__(self, seed: int = 2026, fetch_cc0: bool = True, multi_lod: bool = True) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
         rng = np.random.default_rng(seed)
+        self.lod_counts: tuple[int, ...] = LOD_PATCH_COUNTS if multi_lod else (PATCHES_PER_OBJECT,)
+        self.lod_bank: dict[str, dict[int, LocalMeshTemplate]] = {}
 
-        # Architectural primitives (shared structural grammar; topologies & props split separately)
-        self.slab = build_local_template("slab", *_box_mesh(1.0, 1.0, 1.0, subdiv=4))
-        self.column_round = build_local_template("col_round", *_cylinder_mesh(0.5, 0.5, 1.0, 20, 4))
-        self.column_fluted = build_local_template("col_fluted", *_cylinder_mesh(0.5, 0.46, 1.0, 24, 4, flute_amp=0.07, flute_freq=10))
-        self.vault_shell = build_local_template("vault", *_curved_shell_mesh(1.0, 0.14, math.pi * 0.88, 2.0, 16, 4))
-        self.curved_reflector = build_local_template("reflector", *_curved_shell_mesh(1.0, 0.10, math.pi * 0.55, 1.5, 12, 3))
+        # Gather all raw meshes first so multi-LOD clustering parallelizes cleanly across CPU cores
+        arch_specs = [
+            ("slab", *_box_mesh(1.0, 1.0, 1.0, subdiv=4)),
+            ("col_round", *_cylinder_mesh(0.5, 0.5, 1.0, 20, 4)),
+            ("col_fluted", *_cylinder_mesh(0.5, 0.46, 1.0, 24, 4, flute_amp=0.07, flute_freq=10)),
+            ("vault", *_curved_shell_mesh(1.0, 0.14, math.pi * 0.88, 2.0, 16, 4)),
+            ("reflector", *_curved_shell_mesh(1.0, 0.10, math.pi * 0.55, 1.5, 12, 3)),
+        ]
 
-        # 200 distinct watertight sculptural & interior prop meshes (~1.2k-2.3k tris each)
-        # Strictly split: indices [0..159] -> TRAIN ONLY; indices [160..199] -> HELD-OUT UNSEEN ONLY
-        self.train_props: list[LocalMeshTemplate] = []
-        self.heldout_props: list[LocalMeshTemplate] = []
-
+        prop_specs: list[tuple[str, np.ndarray, np.ndarray, bool]] = []
         furniture_kinds = ["table", "chair", "shelf", "arch", "plinth", "l_baffle", "bench"]
         for i in range(200):
             r = i % 5
@@ -550,11 +554,7 @@ class ArchetypeLibrary:
                 kind = furniture_kinds[(i // 5) % len(furniture_kinds)]
                 v, f = _compound_furniture_mesh(kind, rng)
                 tag = f"{kind}_{i}"
-            tmpl = build_local_template(tag, v, f, n_patches=PATCHES_PER_OBJECT)
-            if i < 160:
-                self.train_props.append(tmpl)
-            else:
-                self.heldout_props.append(tmpl)
+            prop_specs.append((tag, v, f, i >= 160))
 
         # Ephemerally load real CC0/public-domain watertight meshes (80% train / 20% strictly held-out!)
         self.n_cc0_loaded = 0
@@ -562,11 +562,41 @@ class ArchetypeLibrary:
             cc0_meshes = _try_fetch_cc0_watertight_meshes()
             self.n_cc0_loaded = len(cc0_meshes)
             for idx, (cname, cv, cf) in enumerate(cc0_meshes):
-                tmpl = build_local_template(cname, cv, cf, n_patches=PATCHES_PER_OBJECT)
-                if idx % 5 == 0:
-                    self.heldout_props.append(tmpl)
-                else:
-                    self.train_props.append(tmpl)
+                prop_specs.append((cname, cv, cf, (idx % 5 == 0)))
+
+        all_jobs: list[tuple[str, np.ndarray, np.ndarray]] = list(arch_specs) + [
+            (tag, v, f) for (tag, v, f, _is_ho) in prop_specs
+        ]
+
+        def _cluster_one(item: tuple[str, np.ndarray, np.ndarray]) -> tuple[str, dict[int, LocalMeshTemplate]]:
+            nm, vv, ff = item
+            return nm, build_multi_lod_templates(nm, vv, ff, lod_counts=self.lod_counts)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for nm, bank in pool.map(_cluster_one, all_jobs):
+                self.lod_bank[nm] = bank
+
+        self.slab = self.lod_bank["slab"][PATCHES_PER_OBJECT]
+        self.column_round = self.lod_bank["col_round"][PATCHES_PER_OBJECT]
+        self.column_fluted = self.lod_bank["col_fluted"][PATCHES_PER_OBJECT]
+        self.vault_shell = self.lod_bank["vault"][PATCHES_PER_OBJECT]
+        self.curved_reflector = self.lod_bank["reflector"][PATCHES_PER_OBJECT]
+
+        self.train_props: list[LocalMeshTemplate] = []
+        self.heldout_props: list[LocalMeshTemplate] = []
+        for tag, _v, _f, is_ho in prop_specs:
+            tmpl32 = self.lod_bank[tag][PATCHES_PER_OBJECT]
+            if is_ho:
+                self.heldout_props.append(tmpl32)
+            else:
+                self.train_props.append(tmpl32)
+
+    def with_lod(self, tmpl: LocalMeshTemplate, k: int) -> LocalMeshTemplate:
+        """Return the pre-clustered LocalMeshTemplate for the same archetype at patch count k."""
+        bank = self.lod_bank.get(tmpl.name)
+        if bank is not None and k in bank:
+            return bank[k]
+        return tmpl
 
 
 # ---------------------------------------------------------------------------
@@ -707,14 +737,97 @@ def _add_room_enclosure(
         objs.append(ObjectInstance(lib.slab, (W, H, t), 0, 0, 0, (0, 0.5 * H, 0.5 * D + 0.5 * t), front_c, 0.88, 0.0, (0, 0, 0)))
 
 
+def apply_scene_lod(
+    objs: list[ObjectInstance],
+    lib: ArchetypeLibrary,
+    rng: np.random.Generator,
+    mode: str = "distance",
+    W: float = 6.0,
+    H: float = 4.0,
+    D: float = 6.0,
+    max_tokens: int = 680,
+) -> tuple[list[ObjectInstance], list[int]]:
+    """Assign per-object Distance Patch LOD (4, 8, 16, 32, 64) preserving exact geometry & surface area."""
+    if mode == "fixed32" or len(lib.lod_counts) <= 1:
+        return objs, [inst.template.n_patches for inst in objs]
+
+    lods: list[int] = []
+    if mode == "distance":
+        # Sample realistic virtual camera viewpoint (front-outside looking in, room corner, or interior orbit)
+        u = float(rng.random())
+        if u < 0.45:
+            cam = np.array([rng.uniform(-0.35 * W, 0.35 * W), rng.uniform(0.35 * H, 0.65 * H), rng.uniform(0.45 * D, 1.35 * D)], dtype=np.float32)
+        elif u < 0.80:
+            ang = float(rng.uniform(0.0, 2.0 * math.pi))
+            rad = float(rng.uniform(0.35, 0.95)) * max(W, D)
+            cam = np.array([math.cos(ang) * rad, rng.uniform(0.25 * H, 0.75 * H), math.sin(ang) * rad], dtype=np.float32)
+        else:
+            cam = np.array([rng.uniform(-0.4 * W, 0.4 * W), rng.uniform(0.25 * H, 0.70 * H), rng.uniform(-0.4 * D, 0.4 * D)], dtype=np.float32)
+
+        for inst in objs:
+            pos = np.array(inst.pos, dtype=np.float32)
+            rad = 0.5 * float(max(inst.scale))
+            dist = max(float(np.linalg.norm(pos - cam)), 0.35)
+            # Screen-space projected angular coverage with mild jitter so model generalizes across thresholds
+            cov = (rad / dist) * float(rng.uniform(0.78, 1.32))
+            is_em = max(inst.emission) > 1e-3
+            if is_em:
+                # Emitters stay sharp (16-32) when near, or 8 when distant
+                k = 32 if cov >= 0.22 else (16 if cov >= 0.11 else 8)
+            elif cov >= 0.58:
+                k = 64 if (64 in lib.lod_counts and rng.random() < 0.42) else 32
+            elif cov >= 0.28:
+                k = 32
+            elif cov >= 0.16:
+                k = 16
+            elif cov >= 0.095:
+                k = 8
+            else:
+                k = 4
+            lods.append(k)
+    elif mode == "random_mixed":
+        choices = np.array([4, 8, 16, 32, 64], dtype=np.int32)
+        probs = np.array([0.16, 0.22, 0.26, 0.26, 0.10], dtype=np.float64)
+        lods = [int(rng.choice(choices, p=probs)) for _ in objs]
+    else:
+        lods = [PATCHES_PER_OBJECT for _ in objs]
+
+    # Cap total scene tokens gracefully by halving highest-LOD objects if over budget
+    while sum(lods) > max_tokens:
+        mx = max(lods)
+        if mx <= 4:
+            break
+        idx = lods.index(mx)
+        lods[idx] = mx // 2
+
+    out_objs: list[ObjectInstance] = []
+    for inst, k in zip(objs, lods):
+        out_objs.append(
+            ObjectInstance(
+                template=lib.with_lod(inst.template, k),
+                scale=inst.scale,
+                rot_y=inst.rot_y,
+                rot_x=inst.rot_x,
+                rot_z=inst.rot_z,
+                pos=inst.pos,
+                albedo=inst.albedo,
+                roughness=inst.roughness,
+                metallic=inst.metallic,
+                emission=inst.emission,
+            )
+        )
+    return out_objs, lods
+
+
 def generate_scene_spec(
     lib: ArchetypeLibrary,
     rng: np.random.Generator,
     *,
     split: str = "train",
     topology_override: str | None = None,
+    lod_mode: str = "fixed32",
 ) -> tuple[list[ObjectInstance], dict]:
-    """Generate a diverse multi-object 3D room (8-22 objects, 256-704 tokens)."""
+    """Generate a diverse multi-object 3D room (8-24 objects) with optional Mixed Distance Patch LOD."""
     is_heldout = split == "heldout"
     prop_pool = lib.heldout_props if is_heldout else lib.train_props
 
@@ -890,8 +1003,21 @@ def generate_scene_spec(
                 )
             )
 
-    # Interior sculptural props & furniture (3 to 9 objects so total objects = 9 to 20 -> 288-640 tokens!)
-    max_props = max(3, min(9, 19 - len(objs)))
+    # Resolve effective LOD mode ("auto" = 25% fixed32 + 55% distance LOD + 20% random mixed LOD)
+    eff_lod = lod_mode
+    if lod_mode == "auto":
+        u_lod = float(rng.random())
+        if u_lod < 0.25:
+            eff_lod = "fixed32"
+        elif u_lod < 0.80:
+            eff_lod = "distance"
+        else:
+            eff_lod = "random_mixed"
+
+    # Interior sculptural props & furniture (more objects allowed under Distance LOD since far props cost 4-8 tokens!)
+    obj_cap = 24 if eff_lod in ("distance", "random_mixed") else 19
+    prop_hi = 12 if eff_lod in ("distance", "random_mixed") else 9
+    max_props = max(3, min(prop_hi, obj_cap - len(objs)))
     n_props = int(rng.integers(3, max_props + 1))
     placed_xy: list[tuple[float, float, float]] = []
     room_min_xz = min(W, D)
@@ -937,7 +1063,16 @@ def generate_scene_spec(
             )
         )
 
-    meta = {"topology": topo, "split": split, "dims": [round(W, 3), round(H, 3), round(D, 3)], "n_objects": len(objs)}
+    objs, obj_lods = apply_scene_lod(objs, lib, rng, mode=eff_lod, W=W, H=H, D=D)
+    meta = {
+        "topology": topo,
+        "split": split,
+        "lod_mode": eff_lod,
+        "dims": [round(W, 3), round(H, 3), round(D, 3)],
+        "n_objects": len(objs),
+        "n_tokens": int(sum(obj_lods)),
+        "object_lods": obj_lods,
+    }
     return objs, meta
 
 

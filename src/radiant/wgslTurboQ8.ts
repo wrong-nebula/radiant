@@ -522,7 +522,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let g0 = geo[gb + 0u];
   let p = g0.xyz;
   let pn2 = g0.w;
-  let T = geo[gb + 1u].xyz;
+  let g1 = geo[gb + 1u];
+  let T = g1.xyz;
+  let log_area_prior = g1.w;
   let B = geo[gb + 2u].xyz;
   let N = geo[gb + 3u].xyz;
 
@@ -561,7 +563,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   K_out[ob + 3u] = vec4<f32>(qkv_geo[kb + 12u], qkv_geo[kb + 13u], qkv_geo[kb + 14u], qkv_geo[kb + 15u]);
   K_out[ob + 4u] = vec4<f32>(qkv_geo[kb + 16u], qkv_geo[kb + 17u], qkv_geo[kb + 18u], p.x);
   K_out[ob + 5u] = vec4<f32>(p.y, p.z, 1.0, pn2);
-  K_out[ob + 6u] = vec4<f32>(k3.x, k3.y, k3.z, -beta * pn2 - dot(v_w, p));
+  K_out[ob + 6u] = vec4<f32>(k3.x, k3.y, k3.z, -beta * pn2 - dot(v_w, p) + log_area_prior);
   K_out[ob + 7u] = vec4<f32>(-beta, r_w.x, r_w.y, r_w.z);
 
   V_out[ob + 0u] = vec4<f32>(qkv_geo[vb + 0u], qkv_geo[vb + 1u], qkv_geo[vb + 2u], qkv_geo[vb + 3u]);
